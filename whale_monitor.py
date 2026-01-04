@@ -791,8 +791,114 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Monitor Polymarket for Fresh Whale activity"
+        description="Monitor Polymarket for Fresh Whale activity",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Real-time monitoring
+  python whale_monitor.py --webhook YOUR_DISCORD_WEBHOOK_URL
+
+  # Monitor with custom thresholds
+  python whale_monitor.py --min-value 50000 --max-trades 3
+
+  # Run historical backtest (last 7 days)
+  python whale_monitor.py backtest --days 7
+
+  # Backtest with CSV export
+  python whale_monitor.py backtest --days 14 --output whales.csv
+        """
     )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Monitor subcommand (default behavior)
+    monitor_parser = subparsers.add_parser("monitor", help="Real-time monitoring (default)")
+    monitor_parser.add_argument(
+        "--webhook", "-w",
+        help="Discord webhook URL (or set DISCORD_WEBHOOK_URL env var)",
+        default=os.getenv("DISCORD_WEBHOOK_URL", "")
+    )
+    monitor_parser.add_argument(
+        "--min-value", "-m",
+        type=float,
+        default=10000,
+        help="Minimum trade value in USD to trigger alert (default: 10000)"
+    )
+    monitor_parser.add_argument(
+        "--interval", "-i",
+        type=int,
+        default=60,
+        help="Polling interval in seconds (default: 60)"
+    )
+    monitor_parser.add_argument(
+        "--max-trades", "-t",
+        type=int,
+        default=5,
+        help="Max historical trades for 'new account' (default: 5)"
+    )
+    monitor_parser.add_argument(
+        "--account-hours", "-a",
+        type=int,
+        default=72,
+        help="Account age threshold in hours (default: 72)"
+    )
+    monitor_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+    monitor_parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run a single poll cycle then exit (for testing)"
+    )
+
+    # Backtest subcommand
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Run historical backtest for validation"
+    )
+    backtest_parser.add_argument(
+        "--days", "-d",
+        type=int,
+        default=7,
+        help="Number of days to look back (default: 7)"
+    )
+    backtest_parser.add_argument(
+        "--min-value", "-m",
+        type=float,
+        default=10000,
+        help="Minimum trade value in USD (default: 10000)"
+    )
+    backtest_parser.add_argument(
+        "--max-trades", "-t",
+        type=int,
+        default=5,
+        help="Max prior trades for 'new account' (default: 5)"
+    )
+    backtest_parser.add_argument(
+        "--account-hours", "-a",
+        type=int,
+        default=72,
+        help="Account age threshold in hours (default: 72)"
+    )
+    backtest_parser.add_argument(
+        "--output", "-o",
+        type=str,
+        help="Export Fresh Whale results to CSV file"
+    )
+    backtest_parser.add_argument(
+        "--output-all",
+        type=str,
+        help="Export ALL analyzed trades to CSV file"
+    )
+    backtest_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
+    # Add default args for backward compatibility (when no subcommand specified)
     parser.add_argument(
         "--webhook", "-w",
         help="Discord webhook URL (or set DISCORD_WEBHOOK_URL env var)",
@@ -835,7 +941,34 @@ def main():
 
     args = parser.parse_args()
 
-    # Build configuration
+    # Handle backtest command
+    if args.command == "backtest":
+        try:
+            from backtest import BacktestConfig, BacktestEngine, export_to_csv, export_all_trades_csv
+        except ImportError:
+            print("Error: backtest.py module not found. Make sure it's in the same directory.")
+            sys.exit(1)
+
+        config = BacktestConfig(
+            LOOKBACK_DAYS=args.days,
+            MIN_TRADE_VALUE_USD=args.min_value,
+            MAX_HISTORICAL_TRADES=args.max_trades,
+            NEW_ACCOUNT_HOURS=args.account_hours,
+            LOG_LEVEL="DEBUG" if args.debug else "INFO"
+        )
+
+        engine = BacktestEngine(config)
+        results = engine.run()
+        results.print_summary()
+
+        if args.output:
+            export_to_csv(results, args.output)
+        if args.output_all:
+            export_all_trades_csv(results, args.output_all)
+
+        return
+
+    # Default: run real-time monitor
     config = Config(
         DISCORD_WEBHOOK_URL=args.webhook,
         MIN_TRADE_VALUE_USD=args.min_value,
@@ -845,7 +978,6 @@ def main():
         LOG_LEVEL="DEBUG" if args.debug else "INFO"
     )
 
-    # Run monitor
     monitor = WhaleMonitor(config)
     monitor.run(max_iterations=1 if args.test else None)
 

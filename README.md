@@ -8,6 +8,8 @@ A Python tool to monitor Polymarket prediction markets for **"Fresh Whale"** act
 - Detects large trades from new/inactive accounts
 - Discord webhook notifications with rich embeds
 - Configurable detection thresholds
+- **Historical backtest** for validating detection logic
+- CSV export for analysis
 - Available as both Python script and Google Colab notebook
 
 ## Quick Start
@@ -77,6 +79,104 @@ This catches:
 - Brand new wallets making large first bets
 - Dormant wallets suddenly becoming active
 - Potential insider activity or informed trading
+
+## Historical Backtest (Validation)
+
+The backtest module lets you analyze historical trades to validate the detection logic works correctly. This is essential for:
+
+- Verifying the Fresh Whale detection criteria
+- Analyzing patterns in past whale activity
+- Generating reports for research
+
+### Running a Backtest
+
+```bash
+# Analyze last 7 days (default)
+python whale_monitor.py backtest
+
+# Or run backtest.py directly
+python backtest.py --days 7
+
+# Analyze last 30 days with higher threshold
+python backtest.py --days 30 --min-value 50000
+
+# Export results to CSV
+python backtest.py --days 14 --output fresh_whales.csv
+
+# Export ALL large trades (for further analysis)
+python backtest.py --days 7 --output-all all_trades.csv --output whales_only.csv
+```
+
+### Backtest Options
+
+```bash
+python backtest.py --help
+
+Options:
+  -d, --days N          Days to look back (default: 7)
+  -m, --min-value USD   Minimum trade value (default: 10000)
+  -t, --max-trades N    Max prior trades for "new account" (default: 5)
+  -a, --account-hours H Account age threshold in hours (default: 72)
+  -o, --output FILE     Export Fresh Whales to CSV
+  --output-all FILE     Export ALL analyzed trades to CSV
+  --debug               Enable debug logging
+```
+
+### Backtest Output
+
+The backtest generates a detailed summary:
+
+```
+======================================================================
+BACKTEST RESULTS SUMMARY
+======================================================================
+Period: 2024-01-01 to 2024-01-07
+Minimum trade value: $10,000
+Fresh account criteria: <5 trades OR <72h old
+----------------------------------------------------------------------
+Total trades fetched: 1,234
+Large trades analyzed: 156
+Fresh Whales detected: 23
+Unique whale addresses: 19
+Total whale volume: $847,500.00
+Average whale trade size: $36,847.83
+
+----------------------------------------------------------------------
+TOP 10 LARGEST FRESH WHALE TRADES:
+----------------------------------------------------------------------
+1. $125,000.00 - 2024-01-05 14:32:00 UTC
+   Market: Will Bitcoin reach $50,000 by March?
+   Position: Yes @ $0.650
+   Reason: Only 2 prior trades
+   Wallet: 0x1234abcd...ef567890
+...
+```
+
+### CSV Export Format
+
+The exported CSV includes:
+
+| Column | Description |
+|--------|-------------|
+| timestamp | Human-readable trade time |
+| value_usd | Trade value in USD |
+| market_title | Market question |
+| outcome | Yes/No position |
+| price | Share price at purchase |
+| user_address | Wallet address |
+| account_trades_before | Trades BEFORE this one |
+| account_age_hours | Account age at time of trade |
+| is_fresh_whale | Detection result |
+| detection_reason | Why flagged |
+| profile_url | Link to Polymarket profile |
+
+### Key Difference: Point-in-Time Analysis
+
+The backtest analyzes account state **at the time of each trade**, not the current state. This means:
+
+- If an account had 2 trades when they made a $50k bet, it shows "2 prior trades"
+- Even if that account now has 100 trades, the historical analysis is accurate
+- This is crucial for validating that real-time detection would have caught them
 
 ## Getting a Discord Webhook URL
 
@@ -192,7 +292,8 @@ The subgraph provides:
 
 ```
 Polymarket-Outlier-Tracker/
-├── whale_monitor.py              # Main Python script
+├── whale_monitor.py              # Main Python script (real-time monitoring)
+├── backtest.py                   # Historical backtest module
 ├── Polymarket_Whale_Monitor.ipynb # Google Colab notebook
 ├── requirements.txt              # Python dependencies
 ├── .env.example                  # Environment variable template
