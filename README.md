@@ -90,6 +90,16 @@ The backtest module lets you analyze historical trades to validate the detection
 
 ### Running a Backtest
 
+**Option 1: Google Colab / Jupyter Notebook**
+
+Open `Polymarket_Backtest.ipynb` in Google Colab or Jupyter for an interactive experience with:
+- Visual progress indicators
+- Formatted HTML result summaries
+- DataFrame exploration
+- Easy CSV downloads
+
+**Option 2: Command Line**
+
 ```bash
 # Analyze last 7 days (default)
 python whale_monitor.py backtest
@@ -294,7 +304,8 @@ The subgraph provides:
 Polymarket-Outlier-Tracker/
 ├── whale_monitor.py              # Main Python script (real-time monitoring)
 ├── backtest.py                   # Historical backtest module
-├── Polymarket_Whale_Monitor.ipynb # Google Colab notebook
+├── Polymarket_Whale_Monitor.ipynb # Google Colab notebook (real-time)
+├── Polymarket_Backtest.ipynb     # Google Colab notebook (backtest)
 ├── requirements.txt              # Python dependencies
 ├── .env.example                  # Environment variable template
 └── README.md                     # This file
