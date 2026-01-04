@@ -91,6 +91,9 @@ class HistoricalTrade:
     is_fresh_whale: bool
     detection_reason: str
 
+    # User profile
+    username: str = ""  # Polymarket username if available
+
     @property
     def formatted_time(self) -> str:
         return datetime.fromtimestamp(
@@ -112,6 +115,7 @@ class HistoricalTrade:
             "price": self.price,
             "shares": self.amount,
             "user_address": self.user_address,
+            "username": self.username,
             "account_trades_before": self.account_trades_before,
             "account_age_hours": self.account_age_hours_at_trade,
             "is_fresh_whale": self.is_fresh_whale,
@@ -402,7 +406,12 @@ class HistoricalClient:
         return None
 
     def get_user_activity(self, user_address: str) -> List[Dict]:
-        """Get user's trading activity from Data API."""
+        """
+        Get user's trading activity from Data API.
+
+        Also caches market info from activities since Data API returns
+        correct market titles (unlike Gamma API which can be unreliable).
+        """
         address = user_address.lower()
 
         if address in self._user_activity_cache:
@@ -417,10 +426,28 @@ class HistoricalClient:
 
         if response and response.status_code == 200:
             activities = response.json()
+
+            # Cache market info from activities - Data API provides correct titles
+            for act in activities:
+                cond_id = act.get("conditionId")
+                title = act.get("title")
+                if cond_id and title and cond_id not in self._market_cache:
+                    self._market_cache[cond_id] = {
+                        "question": title,
+                        "slug": act.get("slug", ""),
+                        "outcome": act.get("outcome", ""),
+                    }
+
             self._user_activity_cache[address] = activities
             return activities
 
         return []
+
+    def get_username_from_activity(self, activities: List[Dict]) -> str:
+        """Extract username from user activity data."""
+        if activities:
+            return activities[0].get("name", "") or ""
+        return ""
 
     def get_account_trades_before(
         self,
@@ -573,14 +600,28 @@ class BacktestEngine:
             amount_raw = int(split["amount"])
             value_usd = amount_raw / 1_000_000
 
-            # Get market info
-            market_info = self.client.get_market_info(condition)
+            # Get user activity first - this populates market cache with correct titles
+            # and allows us to extract username
+            activities = self.client.get_user_activity(stakeholder)
+            username = self.client.get_username_from_activity(activities)
+
+            # Try to get market info from cache (populated by user activity with correct titles)
+            market_info = self.client._market_cache.get(condition)
+
             if market_info:
                 market_title = market_info.get("question", "Unknown Market")
-                market_id = market_info.get("id", condition)
-            else:
-                market_title = f"Market {condition[:16]}..."
+                outcome = market_info.get("outcome", "Position")
                 market_id = condition
+            else:
+                # Fallback: try Gamma API (may not be reliable for all markets)
+                gamma_info = self.client.get_market_info(condition)
+                if gamma_info:
+                    market_title = gamma_info.get("question", "Unknown Market")
+                    market_id = gamma_info.get("id", condition)
+                else:
+                    market_title = f"Market {condition[:16]}..."
+                    market_id = condition
+                outcome = "Position"
 
             # Get account state at time of trade
             trades_before, first_trade_ts = self.client.get_account_trades_before(
@@ -610,7 +651,7 @@ class BacktestEngine:
                 user_address=stakeholder,
                 market_id=market_id,
                 market_title=market_title,
-                outcome="Position",
+                outcome=outcome,
                 amount=value_usd,
                 price=1.0,
                 value_usd=value_usd,
@@ -620,7 +661,8 @@ class BacktestEngine:
                 account_first_trade_ts=first_trade_ts,
                 account_age_hours_at_trade=age_hours,
                 is_fresh_whale=is_fresh,
-                detection_reason=reason
+                detection_reason=reason,
+                username=username
             )
 
         except (KeyError, ValueError, TypeError) as e:

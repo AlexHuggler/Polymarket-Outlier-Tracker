@@ -91,6 +91,7 @@ class Trade:
     value_usd: float  # Total value in USD
     timestamp: int  # Unix timestamp
     tx_hash: str
+    username: str = ""  # Polymarket username if available
 
     @property
     def formatted_time(self) -> str:
@@ -108,6 +109,7 @@ class AccountProfile:
     first_trade_timestamp: Optional[int]
     total_volume_usd: float
     markets_traded: int
+    username: str = ""  # Polymarket username if available
 
     @property
     def account_age_hours(self) -> Optional[float]:
@@ -218,6 +220,15 @@ class FreshWhaleAlert:
             "url": profile_url
         }
 
+        # Add username field if available
+        if self.trade.username or self.profile.username:
+            username = self.trade.username or self.profile.username
+            embed["fields"].insert(0, {
+                "name": "Username",
+                "value": f"**{username}**",
+                "inline": True
+            })
+
         return embed
 
 
@@ -231,8 +242,7 @@ class PolymarketClient:
 
     Uses multiple endpoints:
     - Activity Subgraph: For detecting large trades (splits)
-    - Gamma API: For market information
-    - Data API: For user trading history
+    - Data API: For user trading history and market information
     """
 
     def __init__(self, config: Config):
@@ -240,8 +250,10 @@ class PolymarketClient:
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # Cache for market info to reduce API calls
+        # Cache for market info to reduce API calls (condition_id -> {title, ...})
         self._market_cache: Dict[str, Dict] = {}
+        # Cache for user activity
+        self._user_activity_cache: Dict[str, List[Dict]] = {}
 
     def _request_with_retry(
         self,
@@ -375,6 +387,8 @@ class PolymarketClient:
         """
         Get user's trading activity from Data API.
 
+        Also caches market info (title) from activity for later use.
+
         Args:
             user_address: User's wallet address
             limit: Max number of activities to fetch
@@ -382,17 +396,44 @@ class PolymarketClient:
         Returns:
             List of activity records
         """
+        address = user_address.lower()
+
+        # Check cache first
+        if address in self._user_activity_cache:
+            return self._user_activity_cache[address]
+
         time.sleep(self.config.RATE_LIMIT_DELAY)
 
         url = f"{self.config.DATA_API_URL}/activity"
-        params = {"user": user_address.lower(), "limit": limit}
+        params = {"user": address, "limit": limit}
 
         response = self._request_with_retry("GET", url, params=params)
 
         if response and response.status_code == 200:
-            return response.json()
+            activities = response.json()
+
+            # Cache market info from activities
+            for act in activities:
+                cond_id = act.get("conditionId")
+                title = act.get("title")
+                if cond_id and title and cond_id not in self._market_cache:
+                    self._market_cache[cond_id] = {
+                        "question": title,
+                        "slug": act.get("slug", ""),
+                        "outcome": act.get("outcome", ""),
+                    }
+
+            self._user_activity_cache[address] = activities
+            return activities
 
         return []
+
+    def get_username_from_activity(self, activities: List[Dict]) -> str:
+        """Extract username from activity data."""
+        if activities:
+            # The 'name' field contains the username
+            return activities[0].get("name", "") or ""
+        return ""
 
     def get_account_profile(self, address: str) -> Optional[AccountProfile]:
         """
@@ -406,6 +447,9 @@ class PolymarketClient:
         """
         activities = self.get_user_activity(address, limit=1000)
 
+        # Extract username from activity data
+        username = self.get_username_from_activity(activities)
+
         if not activities:
             # No history found - truly new account
             return AccountProfile(
@@ -413,7 +457,8 @@ class PolymarketClient:
                 total_trades=0,
                 first_trade_timestamp=None,
                 total_volume_usd=0,
-                markets_traded=0
+                markets_traded=0,
+                username=username
             )
 
         # Filter for TRADE type activities
@@ -425,7 +470,8 @@ class PolymarketClient:
                 total_trades=0,
                 first_trade_timestamp=None,
                 total_volume_usd=0,
-                markets_traded=0
+                markets_traded=0,
+                username=username
             )
 
         # Sort by timestamp ascending to find first trade
@@ -441,7 +487,8 @@ class PolymarketClient:
             total_trades=total_trades,
             first_trade_timestamp=first_trade_ts,
             total_volume_usd=total_volume,
-            markets_traded=len(unique_markets)
+            markets_traded=len(unique_markets),
+            username=username
         )
 
     def get_recent_trades(
@@ -455,7 +502,7 @@ class PolymarketClient:
 
         Combines data from:
         - Activity Subgraph (splits) for trade detection
-        - Gamma API for market information
+        - Data API for market information and usernames
 
         Args:
             since_timestamp: Look for trades after this timestamp
@@ -484,29 +531,39 @@ class PolymarketClient:
                 amount_raw = int(split["amount"])
                 value_usd = amount_raw / 1_000_000  # Convert from raw to USD
 
-                # Get market info from Gamma API
-                market_info = self.get_market_info(condition)
+                # Get user activity to populate market cache and get username
+                activities = self.get_user_activity(stakeholder, limit=100)
+                username = self.get_username_from_activity(activities)
+
+                # Try to get market info from cache (populated by user activity)
+                market_info = self._market_cache.get(condition)
 
                 if market_info:
                     market_title = market_info.get("question", "Unknown Market")
-                    market_id = market_info.get("id", condition)
-                else:
-                    market_title = f"Market {condition[:16]}..."
                     market_id = condition
+                else:
+                    # Fallback: try Gamma API (may not be reliable)
+                    gamma_info = self.get_market_info(condition)
+                    if gamma_info:
+                        market_title = gamma_info.get("question", "Unknown Market")
+                        market_id = gamma_info.get("id", condition)
+                    else:
+                        market_title = f"Market {condition[:16]}..."
+                        market_id = condition
 
                 # Create Trade object
-                # Note: splits don't have outcome/price info, estimate from value
                 trade = Trade(
                     id=split_id,
                     user_address=stakeholder,
                     market_id=market_id,
                     market_title=market_title,
-                    outcome="Position",  # Splits don't indicate Yes/No
+                    outcome=market_info.get("outcome", "Position") if market_info else "Position",
                     amount=amount_raw / 1_000_000,  # Shares
                     price=1.0,  # Unknown from splits
                     value_usd=value_usd,
                     timestamp=timestamp,
-                    tx_hash=split_id.split("_")[0] if "_" in split_id else split_id
+                    tx_hash=split_id.split("_")[0] if "_" in split_id else split_id,
+                    username=username
                 )
                 trades.append(trade)
 
