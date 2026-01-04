@@ -6,15 +6,13 @@ Polymarket Whale Monitor - Historical Backtest Module
 This module provides historical analysis capabilities to validate the
 Fresh Whale detection logic by looking back at past trades.
 
+Data Sources:
+- Activity Subgraph: Historical trade data (splits)
+- Gamma API: Market information
+- Data API: User trading history
+
 Usage:
     python backtest.py --days 7 --min-value 10000 --output results.csv
-
-Features:
-    - Fetch historical trades over configurable time periods
-    - Analyze account state AT THE TIME of each trade (not current state)
-    - Generate detailed reports with all detected Fresh Whales
-    - Export results to CSV for further analysis
-    - Rate limiting and pagination for large datasets
 """
 
 import os
@@ -25,7 +23,7 @@ import logging
 import csv
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Set, Tuple
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from collections import defaultdict
 
 import requests
@@ -38,11 +36,13 @@ import requests
 class BacktestConfig:
     """Configuration for historical backtest."""
 
-    # Polymarket Subgraph endpoint
-    SUBGRAPH_URL: str = (
+    # API Endpoints
+    ACTIVITY_SUBGRAPH_URL: str = (
         "https://api.goldsky.com/api/public/"
-        "project_cl6mb8i9h0003e201j6li0diw/subgraphs/polymarket-subgraph/prod/gn"
+        "project_cl6mb8i9h0003e201j6li0diw/subgraphs/activity-subgraph/0.0.4/gn"
     )
+    GAMMA_API_URL: str = "https://gamma-api.polymarket.com"
+    DATA_API_URL: str = "https://data-api.polymarket.com"
 
     # Detection thresholds
     MIN_TRADE_VALUE_USD: float = 10_000.0
@@ -58,7 +58,7 @@ class BacktestConfig:
     REQUEST_TIMEOUT: int = 30
     MAX_RETRIES: int = 3
     RETRY_DELAY: int = 5
-    RATE_LIMIT_DELAY: float = 0.5  # Delay between API calls
+    RATE_LIMIT_DELAY: float = 0.3  # Delay between API calls
 
     # Logging
     LOG_LEVEL: str = "INFO"
@@ -208,48 +208,35 @@ class BacktestResults:
 
 
 # =============================================================================
-# SUBGRAPH CLIENT WITH HISTORICAL QUERIES
+# API CLIENT
 # =============================================================================
 
-class HistoricalSubgraphClient:
-    """Client for fetching historical data from Polymarket Subgraph."""
+class HistoricalClient:
+    """Client for fetching historical data from Polymarket APIs."""
 
     def __init__(self, config: BacktestConfig):
         self.config = config
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-        # Cache for account profiles to reduce API calls
-        self._account_cache: Dict[str, List[Dict]] = {}
+        # Cache for market info and user activity
+        self._market_cache: Dict[str, Dict] = {}
+        self._user_activity_cache: Dict[str, List[Dict]] = {}
 
-    def _execute_query(
+    def _request_with_retry(
         self,
-        query: str,
-        variables: Optional[Dict] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Execute a GraphQL query with retry logic."""
-        payload = {"query": query}
-        if variables:
-            payload["variables"] = variables
+        method: str,
+        url: str,
+        **kwargs
+    ) -> Optional[requests.Response]:
+        """Make HTTP request with retry logic."""
+        kwargs.setdefault("timeout", self.config.REQUEST_TIMEOUT)
 
         for attempt in range(self.config.MAX_RETRIES):
             try:
-                response = self.session.post(
-                    self.config.SUBGRAPH_URL,
-                    json=payload,
-                    timeout=self.config.REQUEST_TIMEOUT,
-                    headers={"Content-Type": "application/json"}
-                )
+                response = self.session.request(method, url, **kwargs)
                 response.raise_for_status()
-
-                result = response.json()
-
-                if "errors" in result:
-                    self.logger.error(f"GraphQL errors: {result['errors']}")
-                    return None
-
-                return result.get("data")
-
+                return response
             except requests.exceptions.RequestException as e:
                 self.logger.warning(
                     f"Request failed (attempt {attempt + 1}/{self.config.MAX_RETRIES}): {e}"
@@ -259,252 +246,181 @@ class HistoricalSubgraphClient:
                 else:
                     self.logger.error(f"All retry attempts failed: {e}")
                     return None
-
         return None
 
-    def get_historical_trades(
+    def _graphql_query(self, query: str, variables: Optional[Dict] = None) -> Optional[Dict]:
+        """Execute GraphQL query against Activity Subgraph."""
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        response = self._request_with_retry(
+            "POST",
+            self.config.ACTIVITY_SUBGRAPH_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+
+        if not response:
+            return None
+
+        result = response.json()
+        if "errors" in result:
+            self.logger.error(f"GraphQL errors: {result['errors']}")
+            return None
+
+        return result.get("data")
+
+    def get_historical_splits(
         self,
         start_timestamp: int,
         end_timestamp: int,
-        min_value_usd: float = 0
-    ) -> List[Dict[str, Any]]:
+        min_amount_raw: int,
+        progress_callback=None
+    ) -> List[Dict]:
         """
-        Fetch all trades within a time range using pagination.
+        Fetch historical splits (trades) from Activity Subgraph with pagination.
 
-        Returns raw trade data for processing.
+        Args:
+            start_timestamp: Start of time range
+            end_timestamp: End of time range
+            min_amount_raw: Minimum amount in raw units (6 decimals)
+            progress_callback: Optional callback for progress updates
+
+        Returns:
+            List of split records
         """
-        all_trades = []
-        last_timestamp = end_timestamp
+        all_splits = []
         last_id = ""
 
-        # Query for trades - try both schema variants
-        query_v1 = """
-        query GetHistoricalTrades($start: BigInt!, $end: BigInt!, $first: Int!, $lastId: String!) {
-            trades(
+        # Initial query without ID filter
+        query_initial = """
+        query GetHistoricalSplits($start: BigInt!, $end: BigInt!, $minAmount: BigInt!, $first: Int!) {
+            splits(
                 first: $first,
                 orderBy: timestamp,
                 orderDirection: desc,
                 where: {
                     timestamp_gte: $start,
                     timestamp_lte: $end,
-                    id_lt: $lastId
+                    amount_gte: $minAmount
                 }
             ) {
                 id
-                user { id }
-                market { id question }
-                outcome
-                amount
-                price
                 timestamp
-                transactionHash
+                stakeholder
+                condition
+                amount
             }
         }
         """
 
-        query_v1_initial = """
-        query GetHistoricalTrades($start: BigInt!, $end: BigInt!, $first: Int!) {
-            trades(
+        # Paginated query with ID filter
+        query_paginated = """
+        query GetHistoricalSplits($start: BigInt!, $end: BigInt!, $minAmount: BigInt!, $first: Int!, $lastId: String!) {
+            splits(
                 first: $first,
                 orderBy: timestamp,
                 orderDirection: desc,
                 where: {
                     timestamp_gte: $start,
-                    timestamp_lte: $end
+                    timestamp_lte: $end,
+                    amount_gte: $minAmount,
+                    id_lt: $lastId
                 }
             ) {
                 id
-                user { id }
-                market { id question }
-                outcome
-                amount
-                price
                 timestamp
-                transactionHash
+                stakeholder
+                condition
+                amount
             }
         }
         """
 
-        # Alternative query for fpmm-based schema
-        query_v2 = """
-        query GetHistoricalTrades($start: BigInt!, $end: BigInt!, $first: Int!, $skip: Int!) {
-            fpmmTrades(
-                first: $first,
-                skip: $skip,
-                orderBy: creationTimestamp,
-                orderDirection: desc,
-                where: {
-                    creationTimestamp_gte: $start,
-                    creationTimestamp_lte: $end
-                }
-            ) {
-                id
-                creator { id }
-                fpmm { id question }
-                outcomeIndex
-                collateralAmount
-                outcomeTokensAmount
-                creationTimestamp
-                transactionHash
-            }
-        }
-        """
-
-        self.logger.info(f"Fetching trades from {start_timestamp} to {end_timestamp}...")
-
-        # Try v1 schema first
         variables = {
             "start": str(start_timestamp),
             "end": str(end_timestamp),
+            "minAmount": str(min_amount_raw),
             "first": self.config.BATCH_SIZE
         }
 
-        data = self._execute_query(query_v1_initial, variables)
+        # First query
+        data = self._graphql_query(query_initial, variables)
 
-        if data and "trades" in data and data["trades"]:
-            # Use v1 schema with pagination
-            self.logger.info("Using trades schema (v1)")
-            trades = data["trades"]
-            all_trades.extend(trades)
+        if not data or "splits" not in data:
+            return []
 
-            while len(trades) == self.config.BATCH_SIZE:
-                if len(all_trades) >= self.config.MAX_TRADES_TO_ANALYZE:
-                    self.logger.warning(f"Reached max trades limit ({self.config.MAX_TRADES_TO_ANALYZE})")
-                    break
+        splits = data["splits"]
+        all_splits.extend(splits)
 
-                last_id = trades[-1]["id"]
-                variables["lastId"] = last_id
+        if progress_callback:
+            progress_callback(len(all_splits))
 
-                time.sleep(self.config.RATE_LIMIT_DELAY)
-                data = self._execute_query(query_v1, variables)
+        # Paginate
+        while len(splits) == self.config.BATCH_SIZE:
+            if len(all_splits) >= self.config.MAX_TRADES_TO_ANALYZE:
+                self.logger.warning(f"Reached max trades limit ({self.config.MAX_TRADES_TO_ANALYZE})")
+                break
 
-                if not data or "trades" not in data:
-                    break
+            last_id = splits[-1]["id"]
+            variables["lastId"] = last_id
 
-                trades = data["trades"]
-                all_trades.extend(trades)
-                self.logger.debug(f"Fetched {len(all_trades)} trades so far...")
+            time.sleep(self.config.RATE_LIMIT_DELAY)
+            data = self._graphql_query(query_paginated, variables)
 
-            # Convert to standard format
-            return self._normalize_v1_trades(all_trades, min_value_usd)
+            if not data or "splits" not in data:
+                break
 
-        # Try v2 schema (fpmmTrades)
-        skip = 0
-        variables = {
-            "start": str(start_timestamp),
-            "end": str(end_timestamp),
-            "first": self.config.BATCH_SIZE,
-            "skip": skip
-        }
+            splits = data["splits"]
+            all_splits.extend(splits)
 
-        data = self._execute_query(query_v2, variables)
+            if progress_callback:
+                progress_callback(len(all_splits))
 
-        if data and "fpmmTrades" in data:
-            self.logger.info("Using fpmmTrades schema (v2)")
+        return all_splits
 
-            while True:
-                if not data or "fpmmTrades" not in data:
-                    break
+    def get_market_info(self, condition_id: str) -> Optional[Dict]:
+        """Get market information from Gamma API by condition ID."""
+        if condition_id in self._market_cache:
+            return self._market_cache[condition_id]
 
-                trades = data["fpmmTrades"]
-                if not trades:
-                    break
+        time.sleep(self.config.RATE_LIMIT_DELAY)
 
-                all_trades.extend(trades)
+        url = f"{self.config.GAMMA_API_URL}/markets"
+        params = {"conditionId": condition_id}
 
-                if len(trades) < self.config.BATCH_SIZE:
-                    break
+        response = self._request_with_retry("GET", url, params=params)
 
-                if len(all_trades) >= self.config.MAX_TRADES_TO_ANALYZE:
-                    self.logger.warning(f"Reached max trades limit ({self.config.MAX_TRADES_TO_ANALYZE})")
-                    break
+        if response and response.status_code == 200:
+            markets = response.json()
+            if markets and len(markets) > 0:
+                market = markets[0]
+                self._market_cache[condition_id] = market
+                return market
 
-                skip += self.config.BATCH_SIZE
-                variables["skip"] = skip
+        return None
 
-                time.sleep(self.config.RATE_LIMIT_DELAY)
-                data = self._execute_query(query_v2, variables)
+    def get_user_activity(self, user_address: str) -> List[Dict]:
+        """Get user's trading activity from Data API."""
+        address = user_address.lower()
 
-                self.logger.debug(f"Fetched {len(all_trades)} trades so far...")
+        if address in self._user_activity_cache:
+            return self._user_activity_cache[address]
 
-            return self._normalize_v2_trades(all_trades, min_value_usd)
+        time.sleep(self.config.RATE_LIMIT_DELAY)
 
-        self.logger.warning("No trades found with either schema")
+        url = f"{self.config.DATA_API_URL}/activity"
+        params = {"user": address, "limit": 1000}
+
+        response = self._request_with_retry("GET", url, params=params)
+
+        if response and response.status_code == 200:
+            activities = response.json()
+            self._user_activity_cache[address] = activities
+            return activities
+
         return []
-
-    def _normalize_v1_trades(
-        self,
-        trades: List[Dict],
-        min_value_usd: float
-    ) -> List[Dict[str, Any]]:
-        """Normalize v1 schema trades to standard format."""
-        normalized = []
-
-        for t in trades:
-            try:
-                amount = float(t.get("amount", 0))
-                price = float(t.get("price", 0))
-                value_usd = amount * price
-
-                if value_usd < min_value_usd:
-                    continue
-
-                normalized.append({
-                    "id": t["id"],
-                    "user_address": t["user"]["id"],
-                    "market_id": t["market"]["id"],
-                    "market_title": t["market"].get("question", "Unknown Market"),
-                    "outcome": t.get("outcome", "Unknown"),
-                    "amount": amount,
-                    "price": price,
-                    "value_usd": value_usd,
-                    "timestamp": int(t["timestamp"]),
-                    "tx_hash": t.get("transactionHash", "")
-                })
-            except (KeyError, ValueError, TypeError) as e:
-                self.logger.debug(f"Failed to parse trade: {e}")
-                continue
-
-        return normalized
-
-    def _normalize_v2_trades(
-        self,
-        trades: List[Dict],
-        min_value_usd: float
-    ) -> List[Dict[str, Any]]:
-        """Normalize v2 schema (fpmmTrades) to standard format."""
-        normalized = []
-
-        for t in trades:
-            try:
-                # USDC has 6 decimals
-                collateral = float(t.get("collateralAmount", 0)) / 1e6
-                outcome_tokens = float(t.get("outcomeTokensAmount", 0)) / 1e18
-
-                if collateral < min_value_usd:
-                    continue
-
-                price = collateral / outcome_tokens if outcome_tokens > 0 else 0
-                outcome_index = int(t.get("outcomeIndex", 0))
-                outcome = "Yes" if outcome_index == 0 else "No"
-
-                normalized.append({
-                    "id": t["id"],
-                    "user_address": t["creator"]["id"],
-                    "market_id": t["fpmm"]["id"],
-                    "market_title": t["fpmm"].get("question", "Unknown Market"),
-                    "outcome": outcome,
-                    "amount": outcome_tokens,
-                    "price": price,
-                    "value_usd": collateral,
-                    "timestamp": int(t["creationTimestamp"]),
-                    "tx_hash": t.get("transactionHash", "")
-                })
-            except (KeyError, ValueError, TypeError) as e:
-                self.logger.debug(f"Failed to parse fpmm trade: {e}")
-                continue
-
-        return normalized
 
     def get_account_trades_before(
         self,
@@ -519,66 +435,27 @@ class HistoricalSubgraphClient:
 
         Returns: (trade_count_before, first_trade_timestamp)
         """
-        address = address.lower()
+        activities = self.get_user_activity(address)
 
-        # Check cache first
-        if address in self._account_cache:
-            trades = self._account_cache[address]
-        else:
-            trades = self._fetch_all_account_trades(address)
-            self._account_cache[address] = trades
+        if not activities:
+            return 0, None
+
+        # Filter for TRADE type activities
+        trades = [a for a in activities if a.get("type") == "TRADE"]
 
         if not trades:
             return 0, None
 
+        # Sort by timestamp ascending
+        trades_sorted = sorted(trades, key=lambda x: x.get("timestamp", 0))
+
+        # First trade timestamp
+        first_ts = trades_sorted[0].get("timestamp") if trades_sorted else None
+
         # Count trades before the given timestamp
-        trades_before = [t for t in trades if t["timestamp"] < before_timestamp]
+        trades_before = [t for t in trades_sorted if t.get("timestamp", 0) < before_timestamp]
 
-        first_timestamp = trades[0]["timestamp"] if trades else None
-
-        return len(trades_before), first_timestamp
-
-    def _fetch_all_account_trades(self, address: str) -> List[Dict]:
-        """Fetch all trades for an account."""
-        query_v1 = """
-        query GetAccountTrades($address: String!) {
-            user(id: $address) {
-                id
-                trades(first: 1000, orderBy: timestamp, orderDirection: asc) {
-                    id
-                    timestamp
-                }
-            }
-        }
-        """
-
-        query_v2 = """
-        query GetAccountTrades($address: String!) {
-            account(id: $address) {
-                id
-                fpmmTrades(first: 1000, orderBy: creationTimestamp, orderDirection: asc) {
-                    id
-                    creationTimestamp
-                }
-            }
-        }
-        """
-
-        time.sleep(self.config.RATE_LIMIT_DELAY)
-
-        # Try v1
-        data = self._execute_query(query_v1, {"address": address})
-        if data and data.get("user"):
-            trades = data["user"].get("trades", [])
-            return [{"id": t["id"], "timestamp": int(t["timestamp"])} for t in trades]
-
-        # Try v2
-        data = self._execute_query(query_v2, {"address": address})
-        if data and data.get("account"):
-            trades = data["account"].get("fpmmTrades", [])
-            return [{"id": t["id"], "timestamp": int(t["creationTimestamp"])} for t in trades]
-
-        return []
+        return len(trades_before), first_ts
 
 
 # =============================================================================
@@ -590,7 +467,7 @@ class BacktestEngine:
 
     def __init__(self, config: Optional[BacktestConfig] = None):
         self.config = config or BacktestConfig()
-        self.client = HistoricalSubgraphClient(self.config)
+        self.client = HistoricalClient(self.config)
         self.logger = logging.getLogger(self.__class__.__name__)
 
     def _setup_logging(self):
@@ -640,88 +517,115 @@ class BacktestEngine:
         self.logger.info(f"Minimum trade value: ${self.config.MIN_TRADE_VALUE_USD:,.0f}")
         self.logger.info("=" * 60)
 
-        # Fetch historical trades
+        # Convert USD to raw amount (6 decimals for USDC)
+        min_amount_raw = int(self.config.MIN_TRADE_VALUE_USD * 1_000_000)
+
+        # Fetch historical splits
         self.logger.info("Fetching historical trades...")
-        trades = self.client.get_historical_trades(
+
+        def progress_callback(count):
+            self.logger.info(f"  Fetched {count} splits...")
+
+        splits = self.client.get_historical_splits(
             start_timestamp=start_ts,
             end_timestamp=end_ts,
-            min_value_usd=self.config.MIN_TRADE_VALUE_USD
+            min_amount_raw=min_amount_raw,
+            progress_callback=progress_callback
         )
 
-        results.total_trades_fetched = len(trades)
-        self.logger.info(f"Found {len(trades)} trades above ${self.config.MIN_TRADE_VALUE_USD:,.0f}")
+        results.total_trades_fetched = len(splits)
+        self.logger.info(f"Found {len(splits)} large splits")
 
-        # Analyze each trade
+        # Analyze each split
         self.logger.info("Analyzing trades for Fresh Whale patterns...")
 
-        for i, trade_data in enumerate(trades):
-            if (i + 1) % 50 == 0:
-                self.logger.info(f"Processed {i + 1}/{len(trades)} trades...")
+        for i, split in enumerate(splits):
+            if (i + 1) % 25 == 0:
+                self.logger.info(f"  Processed {i + 1}/{len(splits)} trades...")
 
-            historical_trade = self._analyze_trade(trade_data)
-            results.all_large_trades.append(historical_trade)
-            results.large_trades_analyzed += 1
+            historical_trade = self._analyze_split(split)
+            if historical_trade:
+                results.all_large_trades.append(historical_trade)
+                results.large_trades_analyzed += 1
 
-            if historical_trade.is_fresh_whale:
-                results.add_whale(historical_trade)
-                self.logger.info(
-                    f"WHALE: ${historical_trade.value_usd:,.2f} by "
-                    f"{historical_trade.user_address[:10]}... - {historical_trade.detection_reason}"
-                )
+                if historical_trade.is_fresh_whale:
+                    results.add_whale(historical_trade)
+                    self.logger.info(
+                        f"WHALE: ${historical_trade.value_usd:,.2f} by "
+                        f"{historical_trade.user_address[:10]}... - {historical_trade.detection_reason}"
+                    )
 
         self.logger.info(f"Analysis complete. Found {results.fresh_whales_detected} Fresh Whales.")
 
         return results
 
-    def _analyze_trade(self, trade_data: Dict) -> HistoricalTrade:
+    def _analyze_split(self, split: Dict) -> Optional[HistoricalTrade]:
         """
-        Analyze a single trade for Fresh Whale status.
+        Analyze a single split for Fresh Whale status.
 
         Critically, this checks the account state AT THE TIME of the trade.
         """
-        user_address = trade_data["user_address"]
-        trade_timestamp = trade_data["timestamp"]
+        try:
+            split_id = split["id"]
+            timestamp = int(split["timestamp"])
+            stakeholder = split["stakeholder"]
+            condition = split["condition"]
+            amount_raw = int(split["amount"])
+            value_usd = amount_raw / 1_000_000
 
-        # Get account state at time of trade
-        trades_before, first_trade_ts = self.client.get_account_trades_before(
-            user_address, trade_timestamp
-        )
+            # Get market info
+            market_info = self.client.get_market_info(condition)
+            if market_info:
+                market_title = market_info.get("question", "Unknown Market")
+                market_id = market_info.get("id", condition)
+            else:
+                market_title = f"Market {condition[:16]}..."
+                market_id = condition
 
-        # Calculate account age at time of trade
-        if first_trade_ts:
-            age_seconds = trade_timestamp - first_trade_ts
-            age_hours = age_seconds / 3600
-        else:
-            age_hours = None
+            # Get account state at time of trade
+            trades_before, first_trade_ts = self.client.get_account_trades_before(
+                stakeholder, timestamp
+            )
 
-        # Determine if Fresh Whale
-        is_fresh = False
-        reason = ""
+            # Calculate account age at time of trade
+            if first_trade_ts:
+                age_seconds = timestamp - first_trade_ts
+                age_hours = max(0, age_seconds / 3600)
+            else:
+                age_hours = None
 
-        if trades_before < self.config.MAX_HISTORICAL_TRADES:
-            is_fresh = True
-            reason = f"Only {trades_before} prior trades"
-        elif age_hours is not None and age_hours < self.config.NEW_ACCOUNT_HOURS:
-            is_fresh = True
-            reason = f"Account only {age_hours:.1f} hours old at time of trade"
+            # Determine if Fresh Whale
+            is_fresh = False
+            reason = ""
 
-        return HistoricalTrade(
-            id=trade_data["id"],
-            user_address=user_address,
-            market_id=trade_data["market_id"],
-            market_title=trade_data["market_title"],
-            outcome=trade_data["outcome"],
-            amount=trade_data["amount"],
-            price=trade_data["price"],
-            value_usd=trade_data["value_usd"],
-            timestamp=trade_timestamp,
-            tx_hash=trade_data["tx_hash"],
-            account_trades_before=trades_before,
-            account_first_trade_ts=first_trade_ts,
-            account_age_hours_at_trade=age_hours,
-            is_fresh_whale=is_fresh,
-            detection_reason=reason
-        )
+            if trades_before < self.config.MAX_HISTORICAL_TRADES:
+                is_fresh = True
+                reason = f"Only {trades_before} prior trades"
+            elif age_hours is not None and age_hours < self.config.NEW_ACCOUNT_HOURS:
+                is_fresh = True
+                reason = f"Account only {age_hours:.1f} hours old at time of trade"
+
+            return HistoricalTrade(
+                id=split_id,
+                user_address=stakeholder,
+                market_id=market_id,
+                market_title=market_title,
+                outcome="Position",
+                amount=value_usd,
+                price=1.0,
+                value_usd=value_usd,
+                timestamp=timestamp,
+                tx_hash=split_id.split("_")[0] if "_" in split_id else split_id,
+                account_trades_before=trades_before,
+                account_first_trade_ts=first_trade_ts,
+                account_age_hours_at_trade=age_hours,
+                is_fresh_whale=is_fresh,
+                detection_reason=reason
+            )
+
+        except (KeyError, ValueError, TypeError) as e:
+            self.logger.warning(f"Failed to analyze split: {e}")
+            return None
 
 
 # =============================================================================
