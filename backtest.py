@@ -64,6 +64,40 @@ class BacktestConfig:
     LOG_LEVEL: str = "INFO"
 
 
+@dataclass
+class AggregateBacktestConfig:
+    """Configuration for aggregate whale backtest."""
+
+    # API Endpoints (same as BacktestConfig)
+    ACTIVITY_SUBGRAPH_URL: str = (
+        "https://api.goldsky.com/api/public/"
+        "project_cl6mb8i9h0003e201j6li0diw/subgraphs/activity-subgraph/0.0.4/gn"
+    )
+    GAMMA_API_URL: str = "https://gamma-api.polymarket.com"
+    DATA_API_URL: str = "https://data-api.polymarket.com"
+
+    # Aggregate detection thresholds
+    AGGREGATE_MIN_POSITION_USD: float = 30_000.0  # Min aggregate position value
+    ASYMMETRIC_PRICE_THRESHOLD: float = 0.30  # Max avg price for asymmetric
+    MAX_SINGLE_TRADE_FOR_AGGREGATE: float = 10_000.0  # Max single trade (stealth)
+    FRESH_ACCOUNT_MAX_TRADES: int = 10  # Max trades for fresh account
+    FRESH_ACCOUNT_MAX_HOURS: int = 72  # Max account age in hours
+
+    # Backtest parameters
+    LOOKBACK_DAYS: int = 14
+    BATCH_SIZE: int = 100
+    MAX_ACCOUNTS_TO_ANALYZE: int = 1000
+
+    # API settings
+    REQUEST_TIMEOUT: int = 30
+    MAX_RETRIES: int = 3
+    RETRY_DELAY: int = 5
+    RATE_LIMIT_DELAY: float = 0.3
+
+    # Logging
+    LOG_LEVEL: str = "INFO"
+
+
 # =============================================================================
 # DATA MODELS
 # =============================================================================
@@ -207,6 +241,152 @@ class BacktestResults:
                     count = self.trades_by_day[day]
                     bar = "#" * min(count, 50)
                     print(f"{day}: {bar} ({count})")
+
+        print("\n" + "=" * 70)
+
+
+@dataclass
+class AggregatePosition:
+    """Aggregated position in a single market for backtest analysis."""
+    user_address: str
+    market_id: str
+    market_title: str
+    outcome: str
+    total_shares: float
+    average_price: float
+    total_invested_usd: float
+    trade_count: int
+    first_trade_timestamp: int
+    last_trade_timestamp: int
+    max_single_trade_usd: float
+    # Account state at time of last trade
+    account_total_trades: int
+    account_first_trade_ts: Optional[int]
+    account_age_hours: Optional[float]
+    # Detection result
+    is_aggregate_whale: bool
+    detection_reason: str
+    username: str = ""
+
+    @property
+    def formatted_first_trade(self) -> str:
+        return datetime.fromtimestamp(
+            self.first_trade_timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    @property
+    def formatted_last_trade(self) -> str:
+        return datetime.fromtimestamp(
+            self.last_trade_timestamp, tz=timezone.utc
+        ).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    @property
+    def potential_payout(self) -> float:
+        return self.total_shares
+
+    @property
+    def implied_edge(self) -> float:
+        if self.total_invested_usd == 0:
+            return 0
+        return (self.potential_payout - self.total_invested_usd) / self.total_invested_usd
+
+    @property
+    def polymarket_profile_url(self) -> str:
+        return f"https://polymarket.com/profile/{self.user_address}"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "first_trade": self.formatted_first_trade,
+            "last_trade": self.formatted_last_trade,
+            "total_invested_usd": self.total_invested_usd,
+            "potential_payout": self.potential_payout,
+            "implied_edge_pct": self.implied_edge * 100,
+            "market_title": self.market_title,
+            "outcome": self.outcome,
+            "average_price": self.average_price,
+            "total_shares": self.total_shares,
+            "trade_count": self.trade_count,
+            "max_single_trade_usd": self.max_single_trade_usd,
+            "user_address": self.user_address,
+            "username": self.username,
+            "account_total_trades": self.account_total_trades,
+            "account_age_hours": self.account_age_hours,
+            "is_aggregate_whale": self.is_aggregate_whale,
+            "detection_reason": self.detection_reason,
+            "profile_url": self.polymarket_profile_url
+        }
+
+
+@dataclass
+class AggregateBacktestResults:
+    """Summary of aggregate whale backtest results."""
+    start_time: datetime
+    end_time: datetime
+    config: AggregateBacktestConfig
+
+    accounts_analyzed: int = 0
+    positions_analyzed: int = 0
+    aggregate_whales_detected: int = 0
+
+    aggregate_whale_positions: List[AggregatePosition] = field(default_factory=list)
+    all_positions: List[AggregatePosition] = field(default_factory=list)
+
+    # Analytics
+    unique_whale_addresses: Set[str] = field(default_factory=set)
+    total_whale_volume_usd: float = 0.0
+    whales_by_market: Dict[str, int] = field(default_factory=dict)
+
+    def add_whale(self, position: AggregatePosition):
+        """Add a detected aggregate whale position."""
+        self.aggregate_whale_positions.append(position)
+        self.aggregate_whales_detected += 1
+        self.unique_whale_addresses.add(position.user_address)
+        self.total_whale_volume_usd += position.total_invested_usd
+
+        market_key = position.market_title[:50]
+        self.whales_by_market[market_key] = self.whales_by_market.get(market_key, 0) + 1
+
+    def print_summary(self):
+        """Print a summary of aggregate backtest results."""
+        print("\n" + "=" * 70)
+        print("AGGREGATE WHALE BACKTEST RESULTS")
+        print("=" * 70)
+        print(f"Period: {self.start_time.strftime('%Y-%m-%d')} to {self.end_time.strftime('%Y-%m-%d')}")
+        print(f"Min aggregate position: ${self.config.AGGREGATE_MIN_POSITION_USD:,.0f}")
+        print(f"Asymmetric threshold: <{self.config.ASYMMETRIC_PRICE_THRESHOLD:.0%}")
+        print(f"Max single trade: ${self.config.MAX_SINGLE_TRADE_FOR_AGGREGATE:,.0f}")
+        print(f"Fresh account: <{self.config.FRESH_ACCOUNT_MAX_TRADES} trades OR <{self.config.FRESH_ACCOUNT_MAX_HOURS}h old")
+        print("-" * 70)
+        print(f"Accounts analyzed: {self.accounts_analyzed:,}")
+        print(f"Positions analyzed: {self.positions_analyzed:,}")
+        print(f"Aggregate Whales detected: {self.aggregate_whales_detected:,}")
+        print(f"Unique whale addresses: {len(self.unique_whale_addresses):,}")
+        print(f"Total whale volume: ${self.total_whale_volume_usd:,.2f}")
+
+        if self.aggregate_whale_positions:
+            avg_position = self.total_whale_volume_usd / self.aggregate_whales_detected
+            print(f"Average position size: ${avg_position:,.2f}")
+
+            print("\n" + "-" * 70)
+            print("TOP 10 LARGEST AGGREGATE WHALE POSITIONS:")
+            print("-" * 70)
+            sorted_positions = sorted(
+                self.aggregate_whale_positions,
+                key=lambda p: p.total_invested_usd,
+                reverse=True
+            )[:10]
+
+            for i, pos in enumerate(sorted_positions, 1):
+                print(f"\n{i}. ${pos.total_invested_usd:,.2f} invested -> ${pos.potential_payout:,.2f} potential payout")
+                print(f"   Market: {pos.market_title[:55]}...")
+                print(f"   Position: {pos.outcome} @ avg {pos.average_price:.1%}")
+                print(f"   Built via {pos.trade_count} trades (max single: ${pos.max_single_trade_usd:,.2f})")
+                print(f"   Implied edge: {pos.implied_edge * 100:.1f}%")
+                print(f"   Reason: {pos.detection_reason}")
+                wallet_display = f"{pos.user_address[:12]}...{pos.user_address[-8:]}"
+                if pos.username:
+                    wallet_display += f" ({pos.username})"
+                print(f"   Wallet: {wallet_display}")
 
         print("\n" + "=" * 70)
 
@@ -484,6 +664,96 @@ class HistoricalClient:
 
         return len(trades_before), first_ts
 
+    def aggregate_trades_to_positions(
+        self,
+        address: str,
+        lookback_days: int = 14
+    ) -> List[Dict]:
+        """
+        Aggregate an account's trades by market/outcome to find positions.
+
+        Returns a list of position dicts with aggregated metrics.
+        """
+        activities = self.get_user_activity(address)
+
+        if not activities:
+            return []
+
+        # Filter for TRADE type activities within lookback period
+        lookback_ts = int(time.time()) - (lookback_days * 86400)
+        trades = [
+            a for a in activities
+            if a.get("type") == "TRADE" and a.get("timestamp", 0) >= lookback_ts
+        ]
+
+        if not trades:
+            return []
+
+        # Aggregate trades by (market_id, outcome)
+        position_map: Dict[tuple, List[Dict]] = {}
+
+        for trade in trades:
+            cond_id = trade.get("conditionId", "")
+            outcome = trade.get("outcome", "Unknown")
+            key = (cond_id, outcome)
+
+            if key not in position_map:
+                position_map[key] = []
+            position_map[key].append(trade)
+
+        # Build position summaries
+        positions = []
+        for (cond_id, outcome), trade_list in position_map.items():
+            total_shares = 0.0
+            total_invested = 0.0
+            max_single_trade = 0.0
+            first_ts = float('inf')
+            last_ts = 0
+            market_title = "Unknown Market"
+
+            for trade in trade_list:
+                shares = trade.get("outcomeTokensAmount", 0)
+                if isinstance(shares, str):
+                    shares = float(shares)
+                shares = shares / 1_000_000 if shares > 1000 else shares
+
+                usdc_size = trade.get("usdcSize", 0)
+                ts = trade.get("timestamp", 0)
+
+                total_shares += shares
+                total_invested += usdc_size
+                max_single_trade = max(max_single_trade, usdc_size)
+                first_ts = min(first_ts, ts)
+                last_ts = max(last_ts, ts)
+
+                if market_title == "Unknown Market":
+                    title = trade.get("title", "")
+                    if title:
+                        market_title = title
+                    elif cond_id in self._market_cache:
+                        market_title = self._market_cache[cond_id].get(
+                            "question", "Unknown Market"
+                        )
+
+            avg_price = total_invested / total_shares if total_shares > 0 else 0
+            if first_ts == float('inf'):
+                first_ts = 0
+
+            positions.append({
+                "market_id": cond_id,
+                "market_title": market_title,
+                "outcome": outcome,
+                "total_shares": total_shares,
+                "average_price": avg_price,
+                "total_invested_usd": total_invested,
+                "trade_count": len(trade_list),
+                "first_trade_timestamp": int(first_ts),
+                "last_trade_timestamp": int(last_ts),
+                "max_single_trade_usd": max_single_trade
+            })
+
+        return positions
+
 
 # =============================================================================
 # BACKTEST ENGINE
@@ -710,6 +980,259 @@ def export_all_trades_csv(results: BacktestResults, filepath: str):
     print(f"Exported {len(results.all_large_trades)} trades to {filepath}")
 
 
+def export_aggregate_csv(results: AggregateBacktestResults, filepath: str):
+    """Export aggregate whale results to CSV file."""
+    if not results.aggregate_whale_positions:
+        print("No aggregate whales to export.")
+        return
+
+    fieldnames = list(results.aggregate_whale_positions[0].to_dict().keys())
+
+    with open(filepath, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for pos in sorted(results.aggregate_whale_positions,
+                         key=lambda p: p.total_invested_usd, reverse=True):
+            writer.writerow(pos.to_dict())
+
+    print(f"Exported {len(results.aggregate_whale_positions)} aggregate whale positions to {filepath}")
+
+
+# =============================================================================
+# AGGREGATE BACKTEST ENGINE
+# =============================================================================
+
+def run_aggregate_backtest(
+    config: Optional[AggregateBacktestConfig] = None,
+    start_date: Optional[datetime] = None,
+    end_date: Optional[datetime] = None
+) -> AggregateBacktestResults:
+    """
+    Run historical backtest for Aggregate Asymmetric Whale detection.
+
+    This function:
+    1. Finds accounts with significant trading activity
+    2. Aggregates their trades by market
+    3. Checks against AAW detection criteria
+    4. Returns results with all qualifying positions
+    """
+    config = config or AggregateBacktestConfig()
+
+    # Setup logging
+    log_level = getattr(logging, config.LOG_LEVEL.upper(), logging.INFO)
+    logging.basicConfig(
+        level=log_level,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"
+    )
+    logger = logging.getLogger("AggregateBacktest")
+
+    # Set time range
+    if end_date is None:
+        end_date = datetime.now(timezone.utc)
+    if start_date is None:
+        start_date = end_date - timedelta(days=config.LOOKBACK_DAYS)
+
+    start_ts = int(start_date.timestamp())
+    end_ts = int(end_date.timestamp())
+
+    results = AggregateBacktestResults(
+        start_time=start_date,
+        end_time=end_date,
+        config=config
+    )
+
+    logger.info("=" * 60)
+    logger.info("Starting Aggregate Whale Backtest")
+    logger.info(f"Period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}")
+    logger.info(f"Min aggregate position: ${config.AGGREGATE_MIN_POSITION_USD:,.0f}")
+    logger.info(f"Asymmetric threshold: <{config.ASYMMETRIC_PRICE_THRESHOLD:.0%}")
+    logger.info("=" * 60)
+
+    # Create a client (reusing BacktestConfig-compatible settings)
+    class AggregateClient(HistoricalClient):
+        def __init__(self, agg_config: AggregateBacktestConfig):
+            # Create a BacktestConfig with matching settings
+            base_config = BacktestConfig(
+                ACTIVITY_SUBGRAPH_URL=agg_config.ACTIVITY_SUBGRAPH_URL,
+                GAMMA_API_URL=agg_config.GAMMA_API_URL,
+                DATA_API_URL=agg_config.DATA_API_URL,
+                LOOKBACK_DAYS=agg_config.LOOKBACK_DAYS,
+                BATCH_SIZE=agg_config.BATCH_SIZE,
+                REQUEST_TIMEOUT=agg_config.REQUEST_TIMEOUT,
+                MAX_RETRIES=agg_config.MAX_RETRIES,
+                RETRY_DELAY=agg_config.RETRY_DELAY,
+                RATE_LIMIT_DELAY=agg_config.RATE_LIMIT_DELAY
+            )
+            super().__init__(base_config)
+            self.agg_config = agg_config
+
+    client = AggregateClient(config)
+
+    # Step 1: Find accounts with significant activity
+    logger.info("Finding accounts with significant activity...")
+
+    # Use splits to find active accounts
+    min_amount_raw = int(1000 * 1_000_000)  # $1000 minimum per trade
+
+    query = """
+    query GetRecentSplits($start: BigInt!, $end: BigInt!, $minAmount: BigInt!, $first: Int!) {
+        splits(
+            first: $first,
+            orderBy: timestamp,
+            orderDirection: desc,
+            where: {
+                timestamp_gte: $start,
+                timestamp_lte: $end,
+                amount_gte: $minAmount
+            }
+        ) {
+            stakeholder
+            amount
+        }
+    }
+    """
+
+    variables = {
+        "start": str(start_ts),
+        "end": str(end_ts),
+        "minAmount": str(min_amount_raw),
+        "first": 1000
+    }
+
+    data = client._graphql_query(query, variables)
+
+    active_accounts: Dict[str, float] = {}
+    if data and "splits" in data:
+        for split in data["splits"]:
+            addr = split["stakeholder"]
+            amount = int(split["amount"]) / 1_000_000
+            if addr not in active_accounts:
+                active_accounts[addr] = 0
+            active_accounts[addr] += amount
+
+    # Filter to accounts with sufficient volume
+    candidate_accounts = [
+        addr for addr, vol in active_accounts.items()
+        if vol >= config.AGGREGATE_MIN_POSITION_USD
+    ]
+
+    # Limit to max accounts
+    candidate_accounts = candidate_accounts[:config.MAX_ACCOUNTS_TO_ANALYZE]
+
+    logger.info(f"Found {len(candidate_accounts)} candidate accounts to analyze")
+    results.accounts_analyzed = len(candidate_accounts)
+
+    # Step 2: Analyze each account's positions
+    for i, address in enumerate(candidate_accounts):
+        if (i + 1) % 25 == 0:
+            logger.info(f"  Processed {i + 1}/{len(candidate_accounts)} accounts...")
+
+        try:
+            # Get user activity and profile info
+            activities = client.get_user_activity(address)
+            username = client.get_username_from_activity(activities)
+
+            # Get account stats
+            trades = [a for a in activities if a.get("type") == "TRADE"]
+            if not trades:
+                continue
+
+            trades_sorted = sorted(trades, key=lambda x: x.get("timestamp", 0))
+            first_trade_ts = trades_sorted[0].get("timestamp") if trades_sorted else None
+            total_trades = len(trades)
+
+            # Calculate account age
+            if first_trade_ts:
+                age_hours = (time.time() - first_trade_ts) / 3600
+            else:
+                age_hours = None
+
+            # Check fresh account criteria
+            is_fresh = (
+                total_trades < config.FRESH_ACCOUNT_MAX_TRADES or
+                (age_hours is not None and age_hours < config.FRESH_ACCOUNT_MAX_HOURS)
+            )
+
+            if not is_fresh:
+                continue
+
+            # Get aggregated positions
+            positions = client.aggregate_trades_to_positions(address, config.LOOKBACK_DAYS)
+
+            for pos_data in positions:
+                results.positions_analyzed += 1
+
+                # Check all aggregate whale criteria
+                # 1. Aggregate position value >= threshold
+                if pos_data["total_invested_usd"] < config.AGGREGATE_MIN_POSITION_USD:
+                    continue
+
+                # 2. Asymmetric (low-odds position)
+                if pos_data["average_price"] > config.ASYMMETRIC_PRICE_THRESHOLD:
+                    continue
+
+                # 3. Stealth accumulation (no single trade exceeds threshold)
+                if pos_data["max_single_trade_usd"] >= config.MAX_SINGLE_TRADE_FOR_AGGREGATE:
+                    continue
+
+                # 4. Multiple trades
+                if pos_data["trade_count"] < 2:
+                    continue
+
+                # All criteria met - this is an Aggregate Whale!
+                reasons = []
+                if total_trades < config.FRESH_ACCOUNT_MAX_TRADES:
+                    reasons.append(f"only {total_trades} total trades")
+                if age_hours is not None and age_hours < config.FRESH_ACCOUNT_MAX_HOURS:
+                    reasons.append(f"account {age_hours:.1f}h old")
+
+                reason = (
+                    f"Built ${pos_data['total_invested_usd']:,.0f} via "
+                    f"{pos_data['trade_count']} trades at avg {pos_data['average_price']:.1%} "
+                    f"({', '.join(reasons)})"
+                )
+
+                position = AggregatePosition(
+                    user_address=address,
+                    market_id=pos_data["market_id"],
+                    market_title=pos_data["market_title"],
+                    outcome=pos_data["outcome"],
+                    total_shares=pos_data["total_shares"],
+                    average_price=pos_data["average_price"],
+                    total_invested_usd=pos_data["total_invested_usd"],
+                    trade_count=pos_data["trade_count"],
+                    first_trade_timestamp=pos_data["first_trade_timestamp"],
+                    last_trade_timestamp=pos_data["last_trade_timestamp"],
+                    max_single_trade_usd=pos_data["max_single_trade_usd"],
+                    account_total_trades=total_trades,
+                    account_first_trade_ts=first_trade_ts,
+                    account_age_hours=age_hours,
+                    is_aggregate_whale=True,
+                    detection_reason=reason,
+                    username=username
+                )
+
+                results.add_whale(position)
+                logger.info(
+                    f"AGGREGATE WHALE: ${position.total_invested_usd:,.2f} by "
+                    f"{address[:10]}... in {position.market_title[:40]}..."
+                )
+
+            # Rate limit
+            time.sleep(config.RATE_LIMIT_DELAY)
+
+        except Exception as e:
+            logger.warning(f"Error analyzing account {address[:10]}...: {e}")
+            continue
+
+    logger.info(f"Analysis complete. Found {results.aggregate_whales_detected} aggregate whales.")
+    results.print_summary()
+
+    return results
+
+
 # =============================================================================
 # CLI ENTRY POINT
 # =============================================================================
@@ -776,10 +1299,48 @@ Examples:
         action="store_true",
         help="Enable debug logging"
     )
+    # Aggregate detection arguments
+    parser.add_argument(
+        "--aggregate",
+        action="store_true",
+        help="Run aggregate whale detection instead of single-trade detection"
+    )
+    parser.add_argument(
+        "--aggregate-min",
+        type=float,
+        default=30000,
+        help="Minimum aggregate position value in USD (default: 30000)"
+    )
+    parser.add_argument(
+        "--asymmetric-price",
+        type=float,
+        default=0.30,
+        help="Max average price for asymmetric detection (default: 0.30)"
+    )
+    parser.add_argument(
+        "--output-aggregate",
+        type=str,
+        help="Export aggregate whale results to CSV file"
+    )
 
     args = parser.parse_args()
 
-    # Build configuration
+    # Run aggregate backtest if requested
+    if args.aggregate:
+        agg_config = AggregateBacktestConfig(
+            LOOKBACK_DAYS=args.days,
+            AGGREGATE_MIN_POSITION_USD=args.aggregate_min,
+            ASYMMETRIC_PRICE_THRESHOLD=args.asymmetric_price,
+            LOG_LEVEL="DEBUG" if args.debug else "INFO"
+        )
+        agg_results = run_aggregate_backtest(agg_config)
+
+        if args.output_aggregate:
+            export_aggregate_csv(agg_results, args.output_aggregate)
+
+        return
+
+    # Build configuration for standard fresh whale backtest
     config = BacktestConfig(
         LOOKBACK_DAYS=args.days,
         MIN_TRADE_VALUE_USD=args.min_value,
