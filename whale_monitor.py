@@ -51,6 +51,14 @@ class Config:
     POLL_INTERVAL_SECONDS: int = 60  # How often to check for new trades
     LOOKBACK_MINUTES: int = 5  # How far back to look for trades each poll
 
+    # Aggregate detection thresholds (for detecting stealth accumulation)
+    AGGREGATE_MIN_POSITION_USD: float = 30_000.0  # Min aggregate position to trigger
+    ASYMMETRIC_PRICE_THRESHOLD: float = 0.30  # Price below 30% = asymmetric market
+    AGGREGATE_LOOKBACK_DAYS: int = 14  # How far back to look for aggregate positions
+    AGGREGATE_SCAN_INTERVAL_MINUTES: int = 30  # How often to run aggregate scan
+    MAX_SINGLE_TRADE_FOR_AGGREGATE: float = 10_000.0  # Max single trade for stealth pattern
+    ENABLE_AGGREGATE_DETECTION: bool = True  # Enable/disable aggregate detection
+
     # API settings
     REQUEST_TIMEOUT: int = 30  # HTTP request timeout in seconds
     MAX_RETRIES: int = 3  # Max retries for failed requests
@@ -123,6 +131,33 @@ class AccountProfile:
                 return True
 
         return False
+
+
+@dataclass
+class MarketPosition:
+    """Aggregated position in a single market."""
+    market_id: str
+    market_title: str
+    outcome: str  # "Yes" or "No"
+    total_shares: float
+    average_price: float
+    total_invested_usd: float
+    trade_count: int
+    first_trade_timestamp: int
+    last_trade_timestamp: int
+    max_single_trade_usd: float  # Largest individual trade
+
+    @property
+    def is_asymmetric(self) -> bool:
+        """Check if this is an asymmetric (low-odds) position."""
+        return self.average_price < 0.30
+
+    @property
+    def time_span_hours(self) -> float:
+        """Time span from first to last trade in hours."""
+        if self.first_trade_timestamp and self.last_trade_timestamp:
+            return (self.last_trade_timestamp - self.first_trade_timestamp) / 3600
+        return 0
 
 
 @dataclass
@@ -208,6 +243,121 @@ class FreshWhaleAlert:
             "timestamp": self.alert_time.isoformat(),
             "footer": {
                 "text": "Polymarket Whale Monitor"
+            },
+            "url": profile_url
+        }
+
+        return embed
+
+
+@dataclass
+class AggregateWhaleAlert:
+    """Alert data for aggregate position detection (stealth accumulation)."""
+    address: str
+    position: MarketPosition
+    profile: AccountProfile
+    detection_reason: str
+    alert_time: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def to_discord_embed(self) -> Dict[str, Any]:
+        """Format alert as Discord embed with distinctive purple color."""
+        # Purple color for aggregate alerts to distinguish from single-trade
+        if self.position.total_invested_usd >= 100_000:
+            color = 0x8B008B  # Dark magenta for very large
+        elif self.position.total_invested_usd >= 50_000:
+            color = 0x9B59B6  # Purple for large
+        else:
+            color = 0xAA88FF  # Light purple for threshold
+
+        # Build Polymarket profile URL
+        profile_url = f"https://polymarket.com/profile/{self.address}"
+
+        # Format account age
+        if self.profile.account_age_hours is not None:
+            if self.profile.account_age_hours < 1:
+                age_str = f"{int(self.profile.account_age_hours * 60)} minutes"
+            elif self.profile.account_age_hours < 24:
+                age_str = f"{self.profile.account_age_hours:.1f} hours"
+            else:
+                age_str = f"{self.profile.account_age_hours / 24:.1f} days"
+        else:
+            age_str = "Unknown"
+
+        # Format time span
+        if self.position.time_span_hours < 1:
+            span_str = f"{int(self.position.time_span_hours * 60)} minutes"
+        elif self.position.time_span_hours < 24:
+            span_str = f"{self.position.time_span_hours:.1f} hours"
+        else:
+            span_str = f"{self.position.time_span_hours / 24:.1f} days"
+
+        embed = {
+            "title": "Aggregate Position Detected!",
+            "description": (
+                f"Account accumulated a large position through multiple small trades "
+                f"in a low-odds market."
+            ),
+            "color": color,
+            "fields": [
+                {
+                    "name": "Market",
+                    "value": self.position.market_title[:256],
+                    "inline": False
+                },
+                {
+                    "name": "Position",
+                    "value": f"**{self.position.outcome}** @ avg {self.position.average_price:.1%}",
+                    "inline": True
+                },
+                {
+                    "name": "Total Invested",
+                    "value": f"**${self.position.total_invested_usd:,.2f}**",
+                    "inline": True
+                },
+                {
+                    "name": "Total Shares",
+                    "value": f"{self.position.total_shares:,.2f}",
+                    "inline": True
+                },
+                {
+                    "name": "Number of Trades",
+                    "value": str(self.position.trade_count),
+                    "inline": True
+                },
+                {
+                    "name": "Largest Single Trade",
+                    "value": f"${self.position.max_single_trade_usd:,.2f}",
+                    "inline": True
+                },
+                {
+                    "name": "Accumulation Period",
+                    "value": span_str,
+                    "inline": True
+                },
+                {
+                    "name": "Account Age",
+                    "value": age_str,
+                    "inline": True
+                },
+                {
+                    "name": "Total Prior Trades",
+                    "value": str(self.profile.total_trades),
+                    "inline": True
+                },
+                {
+                    "name": "Detection Reason",
+                    "value": self.detection_reason,
+                    "inline": False
+                },
+                {
+                    "name": "Wallet Address",
+                    "value": f"`{self.address[:10]}...{self.address[-8:]}`",
+                    "inline": False
+                }
+            ],
+            "timestamp": self.alert_time.isoformat(),
+            "footer": {
+                "text": "Polymarket Whale Monitor - Aggregate Detection"
             },
             "url": profile_url
         }
@@ -511,6 +661,240 @@ class PolymarketSubgraph:
             markets_traded=0
         )
 
+    def get_account_positions(
+        self,
+        address: str,
+        since_timestamp: int
+    ) -> Dict[str, MarketPosition]:
+        """
+        Fetch all trades for an account since timestamp,
+        aggregated by market into positions.
+
+        Returns: {market_id: MarketPosition}
+        """
+        query = """
+        query GetAccountRecentTrades($address: String!, $since: BigInt!) {
+            user(id: $address) {
+                trades(
+                    first: 1000,
+                    where: { timestamp_gte: $since },
+                    orderBy: timestamp,
+                    orderDirection: asc
+                ) {
+                    id
+                    market {
+                        id
+                        question
+                    }
+                    outcome
+                    amount
+                    price
+                    timestamp
+                }
+            }
+        }
+        """
+
+        alt_query = """
+        query GetAccountRecentTrades($address: String!, $since: BigInt!) {
+            account(id: $address) {
+                fpmmTrades(
+                    first: 1000,
+                    where: { creationTimestamp_gte: $since },
+                    orderBy: creationTimestamp,
+                    orderDirection: asc
+                ) {
+                    id
+                    fpmm {
+                        id
+                        question
+                    }
+                    outcomeIndex
+                    collateralAmount
+                    outcomeTokensAmount
+                    creationTimestamp
+                }
+            }
+        }
+        """
+
+        variables = {"address": address.lower(), "since": str(since_timestamp)}
+        data = self._execute_query(query, variables)
+
+        positions: Dict[str, MarketPosition] = {}
+
+        if data and data.get("user"):
+            trades = data["user"].get("trades", [])
+            positions = self._aggregate_trades_to_positions(trades, "primary")
+
+        if not positions:
+            data = self._execute_query(alt_query, variables)
+            if data and data.get("account"):
+                trades = data["account"].get("fpmmTrades", [])
+                positions = self._aggregate_trades_to_positions(trades, "fpmm")
+
+        self.logger.info(
+            f"Found {len(positions)} market positions for {address[:10]}..."
+        )
+        return positions
+
+    def _aggregate_trades_to_positions(
+        self,
+        trades: List[Dict],
+        schema_type: str
+    ) -> Dict[str, MarketPosition]:
+        """Aggregate individual trades into market positions."""
+        # Group trades by market+outcome
+        position_data: Dict[str, Dict] = {}
+
+        for t in trades:
+            try:
+                if schema_type == "primary":
+                    market_id = t["market"]["id"]
+                    market_title = t["market"].get("question", "Unknown Market")
+                    outcome = t.get("outcome", "Unknown")
+                    amount = float(t.get("amount", 0))
+                    price = float(t.get("price", 0))
+                    value_usd = amount * price
+                    timestamp = int(t["timestamp"])
+                else:  # fpmm schema
+                    market_id = t["fpmm"]["id"]
+                    market_title = t["fpmm"].get("question", "Unknown Market")
+                    outcome_index = int(t.get("outcomeIndex", 0))
+                    outcome = "Yes" if outcome_index == 0 else "No"
+                    collateral = float(t.get("collateralAmount", 0)) / 1e6
+                    outcome_tokens = float(t.get("outcomeTokensAmount", 0)) / 1e18
+                    price = collateral / outcome_tokens if outcome_tokens > 0 else 0
+                    amount = outcome_tokens
+                    value_usd = collateral
+                    timestamp = int(t["creationTimestamp"])
+
+                # Key by market+outcome to track positions separately
+                key = f"{market_id}:{outcome}"
+
+                if key not in position_data:
+                    position_data[key] = {
+                        "market_id": market_id,
+                        "market_title": market_title,
+                        "outcome": outcome,
+                        "total_shares": 0,
+                        "total_invested_usd": 0,
+                        "trade_count": 0,
+                        "first_trade_timestamp": timestamp,
+                        "last_trade_timestamp": timestamp,
+                        "max_single_trade_usd": 0,
+                        "prices": [],
+                    }
+
+                pos = position_data[key]
+                pos["total_shares"] += amount
+                pos["total_invested_usd"] += value_usd
+                pos["trade_count"] += 1
+                pos["last_trade_timestamp"] = max(pos["last_trade_timestamp"], timestamp)
+                pos["first_trade_timestamp"] = min(pos["first_trade_timestamp"], timestamp)
+                pos["max_single_trade_usd"] = max(pos["max_single_trade_usd"], value_usd)
+                pos["prices"].append((value_usd, price))  # For weighted average
+
+            except (KeyError, ValueError, TypeError) as e:
+                self.logger.warning(f"Failed to parse trade for aggregation: {e}")
+                continue
+
+        # Convert to MarketPosition objects
+        positions: Dict[str, MarketPosition] = {}
+        for key, pos in position_data.items():
+            # Calculate weighted average price
+            total_value = sum(p[0] for p in pos["prices"])
+            if total_value > 0:
+                avg_price = sum(p[0] * p[1] for p in pos["prices"]) / total_value
+            else:
+                avg_price = 0
+
+            positions[key] = MarketPosition(
+                market_id=pos["market_id"],
+                market_title=pos["market_title"],
+                outcome=pos["outcome"],
+                total_shares=pos["total_shares"],
+                average_price=avg_price,
+                total_invested_usd=pos["total_invested_usd"],
+                trade_count=pos["trade_count"],
+                first_trade_timestamp=pos["first_trade_timestamp"],
+                last_trade_timestamp=pos["last_trade_timestamp"],
+                max_single_trade_usd=pos["max_single_trade_usd"],
+            )
+
+        return positions
+
+    def get_recent_active_accounts(
+        self,
+        since_timestamp: int,
+        min_trades: int = 2,
+        first: int = 1000
+    ) -> List[str]:
+        """
+        Get list of accounts that have been active since timestamp.
+        Returns deduplicated list of addresses with at least min_trades.
+        """
+        query = """
+        query GetRecentTrades($since: BigInt!, $first: Int!) {
+            trades(
+                first: $first,
+                where: { timestamp_gte: $since },
+                orderBy: timestamp,
+                orderDirection: desc
+            ) {
+                user {
+                    id
+                }
+            }
+        }
+        """
+
+        alt_query = """
+        query GetRecentTrades($since: BigInt!, $first: Int!) {
+            fpmmTrades(
+                first: $first,
+                where: { creationTimestamp_gte: $since },
+                orderBy: creationTimestamp,
+                orderDirection: desc
+            ) {
+                creator {
+                    id
+                }
+            }
+        }
+        """
+
+        variables = {"since": str(since_timestamp), "first": first}
+        data = self._execute_query(query, variables)
+
+        # Count trades per account
+        account_trades: Dict[str, int] = {}
+
+        if data and "trades" in data:
+            for t in data["trades"]:
+                addr = t.get("user", {}).get("id", "")
+                if addr:
+                    account_trades[addr] = account_trades.get(addr, 0) + 1
+
+        if not account_trades:
+            data = self._execute_query(alt_query, variables)
+            if data and "fpmmTrades" in data:
+                for t in data["fpmmTrades"]:
+                    addr = t.get("creator", {}).get("id", "")
+                    if addr:
+                        account_trades[addr] = account_trades.get(addr, 0) + 1
+
+        # Filter to accounts with at least min_trades
+        active_accounts = [
+            addr for addr, count in account_trades.items()
+            if count >= min_trades
+        ]
+
+        self.logger.info(
+            f"Found {len(active_accounts)} accounts with >={min_trades} trades"
+        )
+        return active_accounts
+
 
 # =============================================================================
 # DISCORD ALERTING
@@ -560,19 +944,67 @@ class DiscordNotifier:
             self.logger.error(f"Failed to send Discord alert: {e}")
             return False
 
+    def send_aggregate_alert(self, alert: AggregateWhaleAlert) -> bool:
+        """Send an Aggregate Whale alert to Discord."""
+        if not self.config.DISCORD_WEBHOOK_URL:
+            self.logger.warning("Discord webhook not configured, skipping notification")
+            return False
+
+        embed = alert.to_discord_embed()
+
+        payload = {
+            "username": "Polymarket Whale Monitor",
+            "embeds": [embed]
+        }
+
+        try:
+            response = self.session.post(
+                self.config.DISCORD_WEBHOOK_URL,
+                json=payload,
+                timeout=self.config.REQUEST_TIMEOUT
+            )
+
+            if response.status_code == 204:
+                self.logger.info(
+                    f"Aggregate alert sent for ${alert.position.total_invested_usd:,.2f} "
+                    f"position by {alert.address[:10]}..."
+                )
+                return True
+            else:
+                self.logger.error(
+                    f"Discord webhook failed: {response.status_code} - {response.text}"
+                )
+                return False
+
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Failed to send Discord alert: {e}")
+            return False
+
     def send_startup_notification(self) -> bool:
         """Send a notification that the monitor has started."""
         if not self.config.DISCORD_WEBHOOK_URL:
             return False
 
+        description_lines = [
+            f"Monitoring for trades above **${self.config.MIN_TRADE_VALUE_USD:,.0f}**",
+            f"Polling every **{self.config.POLL_INTERVAL_SECONDS}** seconds",
+        ]
+
+        if self.config.ENABLE_AGGREGATE_DETECTION:
+            description_lines.extend([
+                "",
+                "**Aggregate Detection Enabled:**",
+                f"• Min position: **${self.config.AGGREGATE_MIN_POSITION_USD:,.0f}**",
+                f"• Asymmetric threshold: **{self.config.ASYMMETRIC_PRICE_THRESHOLD:.0%}**",
+                f"• Lookback: **{self.config.AGGREGATE_LOOKBACK_DAYS}** days",
+                f"• Scan interval: **{self.config.AGGREGATE_SCAN_INTERVAL_MINUTES}** min",
+            ])
+
         payload = {
             "username": "Polymarket Whale Monitor",
             "embeds": [{
                 "title": "Whale Monitor Started",
-                "description": (
-                    f"Monitoring for trades above **${self.config.MIN_TRADE_VALUE_USD:,.0f}**\n"
-                    f"Polling every **{self.config.POLL_INTERVAL_SECONDS}** seconds"
-                ),
+                "description": "\n".join(description_lines),
                 "color": 0x0099FF,
                 "timestamp": datetime.now(timezone.utc).isoformat(),
                 "footer": {"text": "Polymarket Whale Monitor"}
@@ -608,12 +1040,21 @@ class WhaleMonitor:
         # Track processed trades to avoid duplicate alerts
         self.processed_trade_ids: Set[str] = set()
 
+        # Track alerted aggregate positions to avoid spam
+        # Key format: f"{address}:{market_id}:{outcome}"
+        self.alerted_aggregate_positions: Set[str] = set()
+
+        # Track last aggregate scan time
+        self.last_aggregate_scan: float = 0
+
         # Statistics
         self.stats = {
             "total_trades_scanned": 0,
             "large_trades_found": 0,
             "fresh_whales_detected": 0,
+            "aggregate_whales_detected": 0,
             "alerts_sent": 0,
+            "aggregate_alerts_sent": 0,
             "start_time": None
         }
 
@@ -714,6 +1155,136 @@ class WhaleMonitor:
 
         return alerts
 
+    def check_aggregate_whale(
+        self,
+        address: str,
+        positions: Dict[str, MarketPosition]
+    ) -> List[AggregateWhaleAlert]:
+        """
+        Check if an account has accumulated large positions through small trades.
+
+        Detection criteria:
+        1. Has position > AGGREGATE_MIN_POSITION_USD in single market
+        2. Average price < ASYMMETRIC_PRICE_THRESHOLD (low-odds bet)
+        3. No single trade > MAX_SINGLE_TRADE_FOR_AGGREGATE (stealth pattern)
+        4. Account is fresh (< MAX_HISTORICAL_TRADES or < NEW_ACCOUNT_HOURS)
+        """
+        alerts = []
+
+        for key, position in positions.items():
+            # Skip if already alerted for this position
+            alert_key = f"{address}:{key}"
+            if alert_key in self.alerted_aggregate_positions:
+                continue
+
+            # Check aggregate value threshold
+            if position.total_invested_usd < self.config.AGGREGATE_MIN_POSITION_USD:
+                continue
+
+            # Check if asymmetric market (low odds)
+            if position.average_price >= self.config.ASYMMETRIC_PRICE_THRESHOLD:
+                continue
+
+            # Check if stealth pattern (no single large trade)
+            if position.max_single_trade_usd >= self.config.MAX_SINGLE_TRADE_FOR_AGGREGATE:
+                continue
+
+            # Must have multiple trades (not just one large trade split)
+            if position.trade_count < 2:
+                continue
+
+            # Fetch account profile
+            profile = self.subgraph.get_account_profile(address)
+            if profile is None:
+                continue
+
+            # Check if account qualifies as fresh
+            if not profile.is_fresh_whale(self.config):
+                self.logger.debug(
+                    f"Account {address[:10]}... has {profile.total_trades} trades, "
+                    f"not fresh for aggregate detection"
+                )
+                continue
+
+            # Build detection reason
+            reason = (
+                f"Accumulated ${position.total_invested_usd:,.0f} through "
+                f"{position.trade_count} trades at avg {position.average_price:.1%} "
+                f"(max single: ${position.max_single_trade_usd:,.0f})"
+            )
+
+            alert = AggregateWhaleAlert(
+                address=address,
+                position=position,
+                profile=profile,
+                detection_reason=reason
+            )
+
+            alerts.append(alert)
+            self.alerted_aggregate_positions.add(alert_key)
+            self.stats["aggregate_whales_detected"] += 1
+
+            self.logger.warning(
+                f"AGGREGATE WHALE DETECTED: ${position.total_invested_usd:,.2f} by "
+                f"{address[:10]}... in '{position.market_title[:40]}...' - {reason}"
+            )
+
+        return alerts
+
+    def run_aggregate_scan(self) -> List[AggregateWhaleAlert]:
+        """
+        Scan for aggregate whale patterns.
+
+        1. Get list of recently active accounts
+        2. For each account, compute market positions
+        3. Check each position against aggregate criteria
+        4. Return alerts for any matches
+        """
+        if not self.config.ENABLE_AGGREGATE_DETECTION:
+            return []
+
+        self.logger.info("Starting aggregate whale scan...")
+        alerts = []
+
+        # Calculate lookback timestamp
+        lookback_seconds = self.config.AGGREGATE_LOOKBACK_DAYS * 24 * 3600
+        since_timestamp = int(time.time()) - lookback_seconds
+
+        # Get recently active accounts (with at least 2 trades)
+        active_accounts = self.subgraph.get_recent_active_accounts(
+            since_timestamp=since_timestamp,
+            min_trades=2
+        )
+
+        self.logger.info(f"Scanning {len(active_accounts)} active accounts for aggregate patterns")
+
+        for address in active_accounts:
+            try:
+                # Get positions for this account
+                positions = self.subgraph.get_account_positions(
+                    address=address,
+                    since_timestamp=since_timestamp
+                )
+
+                # Check for aggregate whale patterns
+                account_alerts = self.check_aggregate_whale(address, positions)
+
+                for alert in account_alerts:
+                    alerts.append(alert)
+
+                    # Send notification
+                    if self.notifier.send_aggregate_alert(alert):
+                        self.stats["aggregate_alerts_sent"] += 1
+
+            except Exception as e:
+                self.logger.warning(f"Error processing account {address[:10]}...: {e}")
+                continue
+
+        self.logger.info(
+            f"Aggregate scan complete: {len(alerts)} alerts generated"
+        )
+        return alerts
+
     def run(self, max_iterations: Optional[int] = None):
         """
         Main monitoring loop.
@@ -731,6 +1302,14 @@ class WhaleMonitor:
         self.logger.info(f"New account threshold: <{self.config.MAX_HISTORICAL_TRADES} trades")
         self.logger.info(f"Account age threshold: <{self.config.NEW_ACCOUNT_HOURS} hours")
         self.logger.info(f"Poll interval: {self.config.POLL_INTERVAL_SECONDS} seconds")
+        if self.config.ENABLE_AGGREGATE_DETECTION:
+            self.logger.info(f"Aggregate detection: ENABLED")
+            self.logger.info(f"  Min aggregate position: ${self.config.AGGREGATE_MIN_POSITION_USD:,.0f}")
+            self.logger.info(f"  Asymmetric threshold: {self.config.ASYMMETRIC_PRICE_THRESHOLD:.0%}")
+            self.logger.info(f"  Lookback period: {self.config.AGGREGATE_LOOKBACK_DAYS} days")
+            self.logger.info(f"  Scan interval: {self.config.AGGREGATE_SCAN_INTERVAL_MINUTES} minutes")
+        else:
+            self.logger.info(f"Aggregate detection: DISABLED")
         self.logger.info("=" * 60)
 
         # Send startup notification
@@ -748,12 +1327,26 @@ class WhaleMonitor:
                 self.logger.debug(f"Starting poll cycle #{iteration}")
 
                 try:
+                    # Run single-trade detection
                     alerts = self.run_single_poll()
 
                     if alerts:
                         self.logger.info(f"Poll #{iteration}: {len(alerts)} alerts sent")
                     else:
                         self.logger.debug(f"Poll #{iteration}: No fresh whales detected")
+
+                    # Check if it's time for aggregate scan
+                    if self.config.ENABLE_AGGREGATE_DETECTION:
+                        now = time.time()
+                        scan_interval = self.config.AGGREGATE_SCAN_INTERVAL_MINUTES * 60
+                        if now - self.last_aggregate_scan >= scan_interval:
+                            self.logger.info("Running periodic aggregate scan...")
+                            aggregate_alerts = self.run_aggregate_scan()
+                            if aggregate_alerts:
+                                self.logger.info(
+                                    f"Aggregate scan: {len(aggregate_alerts)} alerts sent"
+                                )
+                            self.last_aggregate_scan = now
 
                 except Exception as e:
                     self.logger.error(f"Error in poll cycle: {e}", exc_info=True)
@@ -779,6 +1372,9 @@ class WhaleMonitor:
         self.logger.info(f"Large trades found: {self.stats['large_trades_found']}")
         self.logger.info(f"Fresh whales detected: {self.stats['fresh_whales_detected']}")
         self.logger.info(f"Alerts sent: {self.stats['alerts_sent']}")
+        if self.config.ENABLE_AGGREGATE_DETECTION:
+            self.logger.info(f"Aggregate whales detected: {self.stats['aggregate_whales_detected']}")
+            self.logger.info(f"Aggregate alerts sent: {self.stats['aggregate_alerts_sent']}")
         self.logger.info("=" * 60)
 
 
@@ -833,6 +1429,37 @@ def main():
         help="Run a single poll cycle then exit (for testing)"
     )
 
+    # Aggregate detection arguments
+    parser.add_argument(
+        "--aggregate-min",
+        type=float,
+        default=30000,
+        help="Minimum aggregate position in USD to trigger alert (default: 30000)"
+    )
+    parser.add_argument(
+        "--asymmetric-price",
+        type=float,
+        default=0.30,
+        help="Price threshold for asymmetric markets (default: 0.30 = 30%%)"
+    )
+    parser.add_argument(
+        "--aggregate-days",
+        type=int,
+        default=14,
+        help="Lookback period for aggregate detection in days (default: 14)"
+    )
+    parser.add_argument(
+        "--aggregate-interval",
+        type=int,
+        default=30,
+        help="Aggregate scan interval in minutes (default: 30)"
+    )
+    parser.add_argument(
+        "--no-aggregate",
+        action="store_true",
+        help="Disable aggregate detection"
+    )
+
     args = parser.parse_args()
 
     # Build configuration
@@ -842,7 +1469,13 @@ def main():
         POLL_INTERVAL_SECONDS=args.interval,
         MAX_HISTORICAL_TRADES=args.max_trades,
         NEW_ACCOUNT_HOURS=args.account_hours,
-        LOG_LEVEL="DEBUG" if args.debug else "INFO"
+        LOG_LEVEL="DEBUG" if args.debug else "INFO",
+        # Aggregate detection config
+        AGGREGATE_MIN_POSITION_USD=args.aggregate_min,
+        ASYMMETRIC_PRICE_THRESHOLD=args.asymmetric_price,
+        AGGREGATE_LOOKBACK_DAYS=args.aggregate_days,
+        AGGREGATE_SCAN_INTERVAL_MINUTES=args.aggregate_interval,
+        ENABLE_AGGREGATE_DETECTION=not args.no_aggregate,
     )
 
     # Run monitor
