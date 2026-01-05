@@ -6,7 +6,11 @@ Polymarket Whale Monitor
 This script monitors Polymarket for "Fresh Whale" activity - detecting when
 newly created accounts suddenly invest large sums (>$10,000 USD) into markets.
 
-Data Source: Polymarket Subgraph (The Graph) via GraphQL
+Data Sources:
+- Activity Subgraph: Large trade detection (splits)
+- Gamma API: Market information lookup
+- Data API: User trading history
+
 Alerting: Discord Webhook notifications
 
 Author: Polymarket Outlier Tracker
@@ -21,7 +25,6 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Dict, List, Any, Set
 from dataclasses import dataclass, field
-import hashlib
 
 import requests
 
@@ -33,11 +36,13 @@ import requests
 class Config:
     """Configuration settings for the Whale Monitor."""
 
-    # Polymarket Subgraph endpoint
-    SUBGRAPH_URL: str = (
+    # API Endpoints
+    ACTIVITY_SUBGRAPH_URL: str = (
         "https://api.goldsky.com/api/public/"
-        "project_cl6mb8i9h0003e201j6li0diw/subgraphs/polymarket-subgraph/prod/gn"
+        "project_cl6mb8i9h0003e201j6li0diw/subgraphs/activity-subgraph/0.0.4/gn"
     )
+    GAMMA_API_URL: str = "https://gamma-api.polymarket.com"
+    DATA_API_URL: str = "https://data-api.polymarket.com"
 
     # Discord webhook URL (set via environment variable or directly)
     DISCORD_WEBHOOK_URL: str = os.getenv("DISCORD_WEBHOOK_URL", "")
@@ -55,6 +60,7 @@ class Config:
     REQUEST_TIMEOUT: int = 30  # HTTP request timeout in seconds
     MAX_RETRIES: int = 3  # Max retries for failed requests
     RETRY_DELAY: int = 5  # Delay between retries in seconds
+    RATE_LIMIT_DELAY: float = 0.2  # Delay between API calls
 
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
@@ -85,6 +91,7 @@ class Trade:
     value_usd: float  # Total value in USD
     timestamp: int  # Unix timestamp
     tx_hash: str
+    username: str = ""  # Polymarket username if available
 
     @property
     def formatted_time(self) -> str:
@@ -102,6 +109,7 @@ class AccountProfile:
     first_trade_timestamp: Optional[int]
     total_volume_usd: float
     markets_traded: int
+    username: str = ""  # Polymarket username if available
 
     @property
     def account_age_hours(self) -> Optional[float]:
@@ -212,49 +220,55 @@ class FreshWhaleAlert:
             "url": profile_url
         }
 
+        # Add username field if available
+        if self.trade.username or self.profile.username:
+            username = self.trade.username or self.profile.username
+            embed["fields"].insert(0, {
+                "name": "Username",
+                "value": f"**{username}**",
+                "inline": True
+            })
+
         return embed
 
 
 # =============================================================================
-# GRAPHQL QUERIES
+# POLYMARKET API CLIENT
 # =============================================================================
 
-class PolymarketSubgraph:
-    """Client for interacting with the Polymarket Subgraph."""
+class PolymarketClient:
+    """
+    Client for interacting with Polymarket APIs.
+
+    Uses multiple endpoints:
+    - Activity Subgraph: For detecting large trades (splits)
+    - Data API: For user trading history and market information
+    """
 
     def __init__(self, config: Config):
         self.config = config
         self.session = requests.Session()
         self.logger = logging.getLogger(self.__class__.__name__)
 
-    def _execute_query(
+        # Cache for market info to reduce API calls (condition_id -> {title, ...})
+        self._market_cache: Dict[str, Dict] = {}
+        # Cache for user activity
+        self._user_activity_cache: Dict[str, List[Dict]] = {}
+
+    def _request_with_retry(
         self,
-        query: str,
-        variables: Optional[Dict] = None
-    ) -> Optional[Dict[str, Any]]:
-        """Execute a GraphQL query with retry logic."""
-        payload = {"query": query}
-        if variables:
-            payload["variables"] = variables
+        method: str,
+        url: str,
+        **kwargs
+    ) -> Optional[requests.Response]:
+        """Make HTTP request with retry logic."""
+        kwargs.setdefault("timeout", self.config.REQUEST_TIMEOUT)
 
         for attempt in range(self.config.MAX_RETRIES):
             try:
-                response = self.session.post(
-                    self.config.SUBGRAPH_URL,
-                    json=payload,
-                    timeout=self.config.REQUEST_TIMEOUT,
-                    headers={"Content-Type": "application/json"}
-                )
+                response = self.session.request(method, url, **kwargs)
                 response.raise_for_status()
-
-                result = response.json()
-
-                if "errors" in result:
-                    self.logger.error(f"GraphQL errors: {result['errors']}")
-                    return None
-
-                return result.get("data")
-
+                return response
             except requests.exceptions.RequestException as e:
                 self.logger.warning(
                     f"Request failed (attempt {attempt + 1}/{self.config.MAX_RETRIES}): {e}"
@@ -264,8 +278,218 @@ class PolymarketSubgraph:
                 else:
                     self.logger.error(f"All retry attempts failed: {e}")
                     return None
+        return None
+
+    def _graphql_query(self, query: str, variables: Optional[Dict] = None) -> Optional[Dict]:
+        """Execute GraphQL query against Activity Subgraph."""
+        payload = {"query": query}
+        if variables:
+            payload["variables"] = variables
+
+        response = self._request_with_retry(
+            "POST",
+            self.config.ACTIVITY_SUBGRAPH_URL,
+            json=payload,
+            headers={"Content-Type": "application/json"}
+        )
+
+        if not response:
+            return None
+
+        result = response.json()
+        if "errors" in result:
+            self.logger.error(f"GraphQL errors: {result['errors']}")
+            return None
+
+        return result.get("data")
+
+    def get_large_splits(
+        self,
+        since_timestamp: int,
+        min_amount_raw: int,
+        first: int = 100
+    ) -> List[Dict]:
+        """
+        Fetch large splits (trades) from Activity Subgraph.
+
+        Args:
+            since_timestamp: Unix timestamp to look back from
+            min_amount_raw: Minimum amount in raw units (6 decimals for USDC)
+            first: Max number of results
+
+        Returns:
+            List of split records
+        """
+        query = """
+        query GetLargeSplits($since: BigInt!, $minAmount: BigInt!, $first: Int!) {
+            splits(
+                first: $first,
+                orderBy: timestamp,
+                orderDirection: desc,
+                where: {
+                    timestamp_gte: $since,
+                    amount_gte: $minAmount
+                }
+            ) {
+                id
+                timestamp
+                stakeholder
+                condition
+                amount
+            }
+        }
+        """
+
+        variables = {
+            "since": str(since_timestamp),
+            "minAmount": str(min_amount_raw),
+            "first": first
+        }
+
+        data = self._graphql_query(query, variables)
+
+        if data and "splits" in data:
+            return data["splits"]
+
+        return []
+
+    def get_market_info(self, condition_id: str) -> Optional[Dict]:
+        """
+        Get market information from Gamma API by condition ID.
+
+        Args:
+            condition_id: The condition ID from the subgraph
+
+        Returns:
+            Market info dict or None
+        """
+        # Check cache first
+        if condition_id in self._market_cache:
+            return self._market_cache[condition_id]
+
+        time.sleep(self.config.RATE_LIMIT_DELAY)
+
+        url = f"{self.config.GAMMA_API_URL}/markets"
+        params = {"conditionId": condition_id}
+
+        response = self._request_with_retry("GET", url, params=params)
+
+        if response and response.status_code == 200:
+            markets = response.json()
+            if markets and len(markets) > 0:
+                market = markets[0]
+                self._market_cache[condition_id] = market
+                return market
 
         return None
+
+    def get_user_activity(self, user_address: str, limit: int = 100) -> List[Dict]:
+        """
+        Get user's trading activity from Data API.
+
+        Also caches market info (title) from activity for later use.
+
+        Args:
+            user_address: User's wallet address
+            limit: Max number of activities to fetch
+
+        Returns:
+            List of activity records
+        """
+        address = user_address.lower()
+
+        # Check cache first
+        if address in self._user_activity_cache:
+            return self._user_activity_cache[address]
+
+        time.sleep(self.config.RATE_LIMIT_DELAY)
+
+        url = f"{self.config.DATA_API_URL}/activity"
+        params = {"user": address, "limit": limit}
+
+        response = self._request_with_retry("GET", url, params=params)
+
+        if response and response.status_code == 200:
+            activities = response.json()
+
+            # Cache market info from activities
+            for act in activities:
+                cond_id = act.get("conditionId")
+                title = act.get("title")
+                if cond_id and title and cond_id not in self._market_cache:
+                    self._market_cache[cond_id] = {
+                        "question": title,
+                        "slug": act.get("slug", ""),
+                        "outcome": act.get("outcome", ""),
+                    }
+
+            self._user_activity_cache[address] = activities
+            return activities
+
+        return []
+
+    def get_username_from_activity(self, activities: List[Dict]) -> str:
+        """Extract username from activity data."""
+        if activities:
+            # The 'name' field contains the username
+            return activities[0].get("name", "") or ""
+        return ""
+
+    def get_account_profile(self, address: str) -> Optional[AccountProfile]:
+        """
+        Build account profile from user's trading history.
+
+        Args:
+            address: User's wallet address
+
+        Returns:
+            AccountProfile object or None
+        """
+        activities = self.get_user_activity(address, limit=1000)
+
+        # Extract username from activity data
+        username = self.get_username_from_activity(activities)
+
+        if not activities:
+            # No history found - truly new account
+            return AccountProfile(
+                address=address,
+                total_trades=0,
+                first_trade_timestamp=None,
+                total_volume_usd=0,
+                markets_traded=0,
+                username=username
+            )
+
+        # Filter for TRADE type activities
+        trades = [a for a in activities if a.get("type") == "TRADE"]
+
+        if not trades:
+            return AccountProfile(
+                address=address,
+                total_trades=0,
+                first_trade_timestamp=None,
+                total_volume_usd=0,
+                markets_traded=0,
+                username=username
+            )
+
+        # Sort by timestamp ascending to find first trade
+        trades_sorted = sorted(trades, key=lambda x: x.get("timestamp", 0))
+
+        total_trades = len(trades)
+        first_trade_ts = trades_sorted[0].get("timestamp") if trades_sorted else None
+        total_volume = sum(t.get("usdcSize", 0) for t in trades)
+        unique_markets = set(t.get("conditionId", "") for t in trades)
+
+        return AccountProfile(
+            address=address,
+            total_trades=total_trades,
+            first_trade_timestamp=first_trade_ts,
+            total_volume_usd=total_volume,
+            markets_traded=len(unique_markets),
+            username=username
+        )
 
     def get_recent_trades(
         self,
@@ -274,242 +498,80 @@ class PolymarketSubgraph:
         first: int = 100
     ) -> List[Trade]:
         """
-        Fetch recent trades from the subgraph.
+        Fetch recent large trades.
 
-        Note: The actual Polymarket subgraph schema may vary. This query
-        is structured based on common subgraph patterns. You may need to
-        adjust field names based on the actual schema.
-        """
-        # Query for recent trading activity
-        # The actual schema fields may differ - this is a common pattern
-        query = """
-        query GetRecentTrades($since: BigInt!, $first: Int!) {
-            trades(
-                first: $first,
-                orderBy: timestamp,
-                orderDirection: desc,
-                where: { timestamp_gte: $since }
-            ) {
-                id
-                user {
-                    id
-                }
-                market {
-                    id
-                    question
-                }
-                outcome
-                amount
-                price
-                timestamp
-                transactionHash
-            }
-        }
-        """
+        Combines data from:
+        - Activity Subgraph (splits) for trade detection
+        - Data API for market information and usernames
 
-        # Alternative query structure for position-based events
-        position_query = """
-        query GetRecentPositions($since: BigInt!, $first: Int!) {
-            fpmmTrades(
-                first: $first,
-                orderBy: creationTimestamp,
-                orderDirection: desc,
-                where: { creationTimestamp_gte: $since }
-            ) {
-                id
-                creator {
-                    id
-                }
-                fpmm {
-                    id
-                    question
-                }
-                outcomeIndex
-                collateralAmount
-                outcomeTokensAmount
-                creationTimestamp
-                transactionHash
-            }
-        }
-        """
+        Args:
+            since_timestamp: Look for trades after this timestamp
+            min_value_usd: Minimum trade value in USD
+            first: Max results
 
-        # Try the primary query structure first
-        variables = {"since": str(since_timestamp), "first": first}
-        data = self._execute_query(query, variables)
+        Returns:
+            List of Trade objects
+        """
+        # Convert USD to raw amount (6 decimals for USDC)
+        min_amount_raw = int(min_value_usd * 1_000_000)
+
+        # Get large splits from subgraph
+        splits = self.get_large_splits(since_timestamp, min_amount_raw, first)
+
+        self.logger.info(f"Found {len(splits)} large splits from subgraph")
 
         trades = []
+        for split in splits:
+            try:
+                # Parse split data
+                split_id = split["id"]
+                timestamp = int(split["timestamp"])
+                stakeholder = split["stakeholder"]
+                condition = split["condition"]
+                amount_raw = int(split["amount"])
+                value_usd = amount_raw / 1_000_000  # Convert from raw to USD
 
-        if data and "trades" in data:
-            for t in data["trades"]:
-                try:
-                    # Calculate trade value
-                    amount = float(t.get("amount", 0))
-                    price = float(t.get("price", 0))
-                    value_usd = amount * price
+                # Get user activity to populate market cache and get username
+                activities = self.get_user_activity(stakeholder, limit=100)
+                username = self.get_username_from_activity(activities)
 
-                    # Filter by minimum value
-                    if value_usd < min_value_usd:
-                        continue
+                # Try to get market info from cache (populated by user activity)
+                market_info = self._market_cache.get(condition)
 
-                    trade = Trade(
-                        id=t["id"],
-                        user_address=t["user"]["id"],
-                        market_id=t["market"]["id"],
-                        market_title=t["market"].get("question", "Unknown Market"),
-                        outcome=t.get("outcome", "Unknown"),
-                        amount=amount,
-                        price=price,
-                        value_usd=value_usd,
-                        timestamp=int(t["timestamp"]),
-                        tx_hash=t.get("transactionHash", "")
-                    )
-                    trades.append(trade)
-                except (KeyError, ValueError, TypeError) as e:
-                    self.logger.warning(f"Failed to parse trade: {e}")
-                    continue
+                if market_info:
+                    market_title = market_info.get("question", "Unknown Market")
+                    market_id = condition
+                else:
+                    # Fallback: try Gamma API (may not be reliable)
+                    gamma_info = self.get_market_info(condition)
+                    if gamma_info:
+                        market_title = gamma_info.get("question", "Unknown Market")
+                        market_id = gamma_info.get("id", condition)
+                    else:
+                        market_title = f"Market {condition[:16]}..."
+                        market_id = condition
 
-        # If primary query fails, try alternative structure
-        if not trades:
-            data = self._execute_query(position_query, variables)
-            if data and "fpmmTrades" in data:
-                for t in data["fpmmTrades"]:
-                    try:
-                        # Calculate value from collateral
-                        collateral = float(t.get("collateralAmount", 0)) / 1e6  # USDC decimals
-                        outcome_tokens = float(t.get("outcomeTokensAmount", 0)) / 1e18
+                # Create Trade object
+                trade = Trade(
+                    id=split_id,
+                    user_address=stakeholder,
+                    market_id=market_id,
+                    market_title=market_title,
+                    outcome=market_info.get("outcome", "Position") if market_info else "Position",
+                    amount=amount_raw / 1_000_000,  # Shares
+                    price=1.0,  # Unknown from splits
+                    value_usd=value_usd,
+                    timestamp=timestamp,
+                    tx_hash=split_id.split("_")[0] if "_" in split_id else split_id,
+                    username=username
+                )
+                trades.append(trade)
 
-                        # Calculate effective price
-                        price = collateral / outcome_tokens if outcome_tokens > 0 else 0
+            except (KeyError, ValueError, TypeError) as e:
+                self.logger.warning(f"Failed to parse split: {e}")
+                continue
 
-                        if collateral < min_value_usd:
-                            continue
-
-                        outcome_index = int(t.get("outcomeIndex", 0))
-                        outcome = "Yes" if outcome_index == 0 else "No"
-
-                        trade = Trade(
-                            id=t["id"],
-                            user_address=t["creator"]["id"],
-                            market_id=t["fpmm"]["id"],
-                            market_title=t["fpmm"].get("question", "Unknown Market"),
-                            outcome=outcome,
-                            amount=outcome_tokens,
-                            price=price,
-                            value_usd=collateral,
-                            timestamp=int(t["creationTimestamp"]),
-                            tx_hash=t.get("transactionHash", "")
-                        )
-                        trades.append(trade)
-                    except (KeyError, ValueError, TypeError) as e:
-                        self.logger.warning(f"Failed to parse fpmm trade: {e}")
-                        continue
-
-        self.logger.info(f"Found {len(trades)} trades above ${min_value_usd:,.0f}")
         return trades
-
-    def get_account_profile(self, address: str) -> Optional[AccountProfile]:
-        """
-        Fetch account history and profile information.
-
-        This queries the user's trading history to determine:
-        - Total number of trades
-        - First trade timestamp (account age)
-        - Total volume traded
-        """
-        query = """
-        query GetAccountProfile($address: String!) {
-            user(id: $address) {
-                id
-                trades(first: 1000, orderBy: timestamp, orderDirection: asc) {
-                    id
-                    timestamp
-                    amount
-                    price
-                }
-            }
-        }
-        """
-
-        # Alternative query for fpmm-based schema
-        alt_query = """
-        query GetAccountProfile($address: String!) {
-            account(id: $address) {
-                id
-                fpmmTrades(first: 1000, orderBy: creationTimestamp, orderDirection: asc) {
-                    id
-                    creationTimestamp
-                    collateralAmount
-                    fpmm {
-                        id
-                    }
-                }
-            }
-        }
-        """
-
-        variables = {"address": address.lower()}
-        data = self._execute_query(query, variables)
-
-        if data and data.get("user"):
-            user = data["user"]
-            trades = user.get("trades", [])
-
-            total_trades = len(trades)
-            first_timestamp = int(trades[0]["timestamp"]) if trades else None
-
-            # Calculate total volume
-            total_volume = sum(
-                float(t.get("amount", 0)) * float(t.get("price", 0))
-                for t in trades
-            )
-
-            # Count unique markets
-            markets = set()
-            # Note: market info not available in this query structure
-
-            return AccountProfile(
-                address=address,
-                total_trades=total_trades,
-                first_trade_timestamp=first_timestamp,
-                total_volume_usd=total_volume,
-                markets_traded=len(markets)
-            )
-
-        # Try alternative query
-        data = self._execute_query(alt_query, variables)
-
-        if data and data.get("account"):
-            account = data["account"]
-            trades = account.get("fpmmTrades", [])
-
-            total_trades = len(trades)
-            first_timestamp = int(trades[0]["creationTimestamp"]) if trades else None
-
-            # Calculate total volume from collateral
-            total_volume = sum(
-                float(t.get("collateralAmount", 0)) / 1e6
-                for t in trades
-            )
-
-            # Count unique markets
-            markets = set(t.get("fpmm", {}).get("id", "") for t in trades)
-
-            return AccountProfile(
-                address=address,
-                total_trades=total_trades,
-                first_trade_timestamp=first_timestamp,
-                total_volume_usd=total_volume,
-                markets_traded=len(markets)
-            )
-
-        # Return empty profile if account not found (truly new)
-        return AccountProfile(
-            address=address,
-            total_trades=0,
-            first_trade_timestamp=None,
-            total_volume_usd=0,
-            markets_traded=0
-        )
 
 
 # =============================================================================
@@ -601,7 +663,7 @@ class WhaleMonitor:
         self.config = config or Config()
         self.config.validate()
 
-        self.subgraph = PolymarketSubgraph(self.config)
+        self.client = PolymarketClient(self.config)
         self.notifier = DiscordNotifier(self.config)
         self.logger = logging.getLogger(self.__class__.__name__)
 
@@ -650,7 +712,7 @@ class WhaleMonitor:
         )
 
         # Fetch account profile to check if "fresh"
-        profile = self.subgraph.get_account_profile(trade.user_address)
+        profile = self.client.get_account_profile(trade.user_address)
 
         if profile is None:
             self.logger.warning(f"Could not fetch profile for {trade.user_address}")
@@ -697,7 +759,7 @@ class WhaleMonitor:
         since_timestamp = int(time.time()) - lookback_seconds
 
         # Fetch recent trades
-        trades = self.subgraph.get_recent_trades(
+        trades = self.client.get_recent_trades(
             since_timestamp=since_timestamp,
             min_value_usd=self.config.MIN_TRADE_VALUE_USD
         )
@@ -791,8 +853,114 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Monitor Polymarket for Fresh Whale activity"
+        description="Monitor Polymarket for Fresh Whale activity",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Real-time monitoring
+  python whale_monitor.py --webhook YOUR_DISCORD_WEBHOOK_URL
+
+  # Monitor with custom thresholds
+  python whale_monitor.py --min-value 50000 --max-trades 3
+
+  # Run historical backtest (last 7 days)
+  python whale_monitor.py backtest --days 7
+
+  # Backtest with CSV export
+  python whale_monitor.py backtest --days 14 --output whales.csv
+        """
     )
+
+    subparsers = parser.add_subparsers(dest="command", help="Commands")
+
+    # Monitor subcommand (default behavior)
+    monitor_parser = subparsers.add_parser("monitor", help="Real-time monitoring (default)")
+    monitor_parser.add_argument(
+        "--webhook", "-w",
+        help="Discord webhook URL (or set DISCORD_WEBHOOK_URL env var)",
+        default=os.getenv("DISCORD_WEBHOOK_URL", "")
+    )
+    monitor_parser.add_argument(
+        "--min-value", "-m",
+        type=float,
+        default=10000,
+        help="Minimum trade value in USD to trigger alert (default: 10000)"
+    )
+    monitor_parser.add_argument(
+        "--interval", "-i",
+        type=int,
+        default=60,
+        help="Polling interval in seconds (default: 60)"
+    )
+    monitor_parser.add_argument(
+        "--max-trades", "-t",
+        type=int,
+        default=5,
+        help="Max historical trades for 'new account' (default: 5)"
+    )
+    monitor_parser.add_argument(
+        "--account-hours", "-a",
+        type=int,
+        default=72,
+        help="Account age threshold in hours (default: 72)"
+    )
+    monitor_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+    monitor_parser.add_argument(
+        "--test",
+        action="store_true",
+        help="Run a single poll cycle then exit (for testing)"
+    )
+
+    # Backtest subcommand
+    backtest_parser = subparsers.add_parser(
+        "backtest",
+        help="Run historical backtest for validation"
+    )
+    backtest_parser.add_argument(
+        "--days", "-d",
+        type=int,
+        default=7,
+        help="Number of days to look back (default: 7)"
+    )
+    backtest_parser.add_argument(
+        "--min-value", "-m",
+        type=float,
+        default=10000,
+        help="Minimum trade value in USD (default: 10000)"
+    )
+    backtest_parser.add_argument(
+        "--max-trades", "-t",
+        type=int,
+        default=5,
+        help="Max prior trades for 'new account' (default: 5)"
+    )
+    backtest_parser.add_argument(
+        "--account-hours", "-a",
+        type=int,
+        default=72,
+        help="Account age threshold in hours (default: 72)"
+    )
+    backtest_parser.add_argument(
+        "--output", "-o",
+        type=str,
+        help="Export Fresh Whale results to CSV file"
+    )
+    backtest_parser.add_argument(
+        "--output-all",
+        type=str,
+        help="Export ALL analyzed trades to CSV file"
+    )
+    backtest_parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Enable debug logging"
+    )
+
+    # Add default args for backward compatibility (when no subcommand specified)
     parser.add_argument(
         "--webhook", "-w",
         help="Discord webhook URL (or set DISCORD_WEBHOOK_URL env var)",
@@ -835,7 +1003,34 @@ def main():
 
     args = parser.parse_args()
 
-    # Build configuration
+    # Handle backtest command
+    if args.command == "backtest":
+        try:
+            from backtest import BacktestConfig, BacktestEngine, export_to_csv, export_all_trades_csv
+        except ImportError:
+            print("Error: backtest.py module not found. Make sure it's in the same directory.")
+            sys.exit(1)
+
+        config = BacktestConfig(
+            LOOKBACK_DAYS=args.days,
+            MIN_TRADE_VALUE_USD=args.min_value,
+            MAX_HISTORICAL_TRADES=args.max_trades,
+            NEW_ACCOUNT_HOURS=args.account_hours,
+            LOG_LEVEL="DEBUG" if args.debug else "INFO"
+        )
+
+        engine = BacktestEngine(config)
+        results = engine.run()
+        results.print_summary()
+
+        if args.output:
+            export_to_csv(results, args.output)
+        if args.output_all:
+            export_all_trades_csv(results, args.output_all)
+
+        return
+
+    # Default: run real-time monitor
     config = Config(
         DISCORD_WEBHOOK_URL=args.webhook,
         MIN_TRADE_VALUE_USD=args.min_value,
@@ -845,7 +1040,6 @@ def main():
         LOG_LEVEL="DEBUG" if args.debug else "INFO"
     )
 
-    # Run monitor
     monitor = WhaleMonitor(config)
     monitor.run(max_iterations=1 if args.test else None)
 
